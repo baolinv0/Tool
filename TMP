@@ -1,23 +1,1717 @@
-QuietWholeBody
-从接收者声学要求反推声源允许范围；
-从声源允许范围反推接触状态可行域；
-把接触状态可行域编译成 WBC 约束，而不是只输出一个速度值。
 
-对当前这个具体声学事件，机器人有哪些控制自由度真正能够影响目标人员听到的哪一部分声音，影响方向和强度分别是多少？
-机器人控制变量
-    ↓
-接触状态变化
-    ↓
-声源激励模态
-    ↓
-空气声/结构声传播
-    ↓
-目标人员位置的声学分量
 
-完整机制应是：
-识别即将发生的声学事件
-→ 分解目标人员处的超标声学分量
-→ 计算当前控制变量对这些分量的事件级影响关系
-→ 选择最小有效控制变量集合
-→ 将原始 WBC 可行域投影到声学安全子域
-→ 执行后根据归因残差只更新对应关系
+
+
+下面按 **“整个生产 Pipeline”** 和 **“可视化 Pipeline”** 两部分说明。当前系统的核心约束是：
+
+> **Reference 决定最终 photometric target；Proposal 只提供 Source 坐标系下的风格先验；Source 决定内容、几何、纹理；最终 PGT 只能由 Renderer(Source, RenderSpec) 生成。** fileciteturn1file0
+
+---
+
+# 一、整个 Pipeline
+
+整体数据流可以压缩成：
+
+```text
+Source B_out                         Reference A_GT_ref
+    │                                      │
+    ├──── Canonicalization                 ├──── Canonicalization
+    │                                      │
+    ├──── Semantic Analysis                ├──── Semantic Analysis
+    │                                      │
+    └───────────────┬──────────────────────┘
+                    ▼
+          Pair Compatibility
+                    │
+                    ▼
+          Person Region Matching
+                    │
+                    ▼
+      Direct Reference Style Target
+      ├── Global Tone
+      ├── Semantic Region Tone
+      ├── Cross-region Relationship
+      ├── Low-frequency Color
+      └── Target Reliability
+                    │
+          ┌─────────┴─────────┐
+          │                   │
+          ▼                   ▼
+   Direct Optimizer      VLM Diagnosis
+                              │
+                              ▼
+                       Generative Editor
+                              │
+                              ▼
+                         Raw Proposals
+                              │
+                              ▼
+                    Proposal Style Evidence
+                    ├── Spatial
+                    ├── Region
+                    ├── Relationship
+                    ├── Color
+                    └── Confidence
+                              │
+          └─────────┬─────────┘
+                    ▼
+             Hybrid Optimizer
+                    │
+                    ▼
+        Source-Locked Renderer
+                    │
+                    ▼
+              Candidates
+                    │
+                    ▼
+              Qualification
+                    │
+                    ▼
+          Hierarchical Selector
+                    │
+                    ▼
+              Final 16-bit PGT
+```
+
+这个 V4 Hybrid 允许 Source 和 Reference 是**同场景但明显不对齐**的，包括不同分辨率、crop、framing、人物尺度和位置变化。系统已经明确不再依赖 `Source(x,y) ↔ Reference(x,y)`。fileciteturn1file0
+
+---
+
+## 1. 输入
+
+每个样本只有两个核心输入：
+
+```text
+B_out
+= 目标 Camera 拍摄图像
+= Source
+
+A_GT_ref
+= Reference Camera 同场景图像
+= Reference
+```
+
+最终目标不是生成 Reference 的复制品，而是：
+
+```text
+PGT geometry/content/detail ≈ B_out
+PGT Tone / low-frequency Color ≈ A_GT_ref
+```
+
+即：
+
+```text
+Reference 的成像风格
++
+Source 的真实内容
+```
+
+---
+
+# 二、Stage 1：Pair Compatibility
+
+首先不做 registration，而只确认：
+
+```text
+这两张图是不是合法输入
+```
+
+记录：
+
+```text
+Source resolution
+Reference resolution
+aspect ratio difference
+same resolution?
+same aspect ratio?
+pair/content contract
+```
+
+例如：
+
+```text
+Source:    1920 × 1080
+Reference: 4032 × 3024
+```
+
+仍然可以进入后续系统。
+
+不会再有：
+
+```text
+dx = 2
+dy = -1
+
+alignment confidence
+gross structural mismatch
+```
+
+这类旧 V4 small-shift 信息。fileciteturn2file0
+
+---
+
+# 三、Stage 2：双侧 Canonicalization
+
+两张图**各自独立**转换到统一分析空间。
+
+核心目的不是让它们空间对齐，而是让：
+
+```text
+Tone statistics
+Color statistics
+```
+
+处于一致表示空间。
+
+例如：
+
+```text
+Input encoded RGB
+      ↓
+decode transfer function
+      ↓
+working RGB
+      ↓
+linear RGB
+      ↓
+log luminance
+```
+
+Color 则进入 perceptual chroma space。
+
+这样避免把：
+
+```text
+Gamma 不同
+颜色空间不同
+Transfer function 不同
+```
+
+误判成 Camera style difference。原始设计也明确要求 Tone 使用 linear/log luminance，Color 使用 perceptual chroma representation。fileciteturn0file0
+
+---
+
+# 四、Stage 3：双侧语义分析
+
+Source 和 Reference 分别运行完全相同的：
+
+```text
+OneFormer
+   ↓
+Panoptic Segmentation
+   ├── person instances
+   ├── sky
+   └── vegetation
+
+低质量 person
+   ↓
+SAM 2.1 refinement
+
+Face/Skin Parser
+   ↓
+face / skin
+```
+
+最终得到：
+
+```text
+Source Semantic Bundle
+Reference Semantic Bundle
+```
+
+语义模块的冻结职责是：
+
+```text
+OneFormer
+= 主场景理解 + person instance
+
+SAM2.1
+= 只修低质量 person mask
+
+Face/Skin Parser
+= face / skin parsing
+```
+
+而不是堆多个 person detector。fileciteturn0file1
+
+---
+
+## 语义输出
+
+Aggregate：
+
+```text
+face
+skin
+human
+sky
+vegetation
+background
+```
+
+实例：
+
+```text
+person_0
+person_1
+...
+```
+
+并产生优化真正使用的互斥 partition：
+
+```text
+face
+body_skin
+human_non_skin
+sky
+vegetation
+background
+```
+
+避免：
+
+```text
+face ⊂ skin ⊂ human
+```
+
+导致一个 pixel 被算三次。fileciteturn0file1
+
+---
+
+# 五、Stage 4：Person Region Matching
+
+这里开始解决：
+
+> Reference 和 Source 不对齐时，哪个人物对应哪个人物？
+
+但仍然**不做 pixel correspondence**。
+
+### 单人
+
+```text
+Source person count = 1
+Reference person count = 1
+→ 直接对应
+```
+
+### 多人
+
+比较：
+
+```text
+左右相对顺序
+上下相对顺序
+relative area
+normalized center
+face existence
+bbox shape
+```
+
+当前 score 大致是：
+
+```text
+rank consistency       0.30
+relative area          0.20
+normalized center      0.20
+face consistency       0.15
+bbox shape             0.15
+```
+
+因此即使：
+
+```text
+Source person mask
+vs
+Reference person mask
+
+IoU ≈ 0
+```
+
+也可能正确匹配。fileciteturn1file0
+
+---
+
+# 六、Stage 5：Direct Reference Style Target
+
+这是整个系统的 **WHAT 分支**。
+
+即：
+
+> Reference 到底要求 Source 变成什么 photofinishing？
+
+它并不生成图片，而是提取**目标描述**。
+
+---
+
+## 6.1 Global Tone
+
+测：
+
+```text
+median
+quantiles
+shadow
+midtone
+highlight
+contrast
+```
+
+例如：
+
+```text
+Source median       = -1.2 EV
+Reference median    = -0.8 EV
+
+Reference p95       比 Source 低
+```
+
+意味着：
+
+```text
+整体中间调需要抬高
+高光需要更强 roll-off
+```
+
+---
+
+# 七、Stage 6：Semantic Region Target
+
+分别测：
+
+```text
+face
+body_skin
+human_non_skin
+sky
+vegetation
+background
+person_i
+```
+
+比如：
+
+```text
+face:
+Source median = -0.8 EV
+Ref median    = -0.4 EV
+
+→ face target ≈ +0.4 EV
+```
+
+这里是 non-aligned pair 最重要的信息之一：
+
+```text
+Source face
+↔
+Reference face
+```
+
+而不是：
+
+```text
+Source pixel(x,y)
+↔
+Reference pixel(x,y)
+```
+
+---
+
+# 八、Stage 7：Relationship Target
+
+这一层非常重要。
+
+不仅问：
+
+```text
+Face 自己有多亮？
+```
+
+而是问：
+
+```text
+Face 相对于 Background 应该多亮？
+```
+
+典型关系：
+
+```text
+face-background EV
+
+human-background EV
+
+sky-foreground highlight
+
+vegetation-background EV
+```
+
+比如：
+
+```text
+Reference:
+face - background = +0.65 EV
+
+Source:
+face - background = +0.15 EV
+```
+
+则真正希望恢复的是：
+
+```text
+人物应该比背景再明显抬高
+```
+
+这比直接追 global histogram 更接近所谓的 **camera photofinishing hierarchy**。
+
+---
+
+# 九、Stage 8：Color Target
+
+这里已经不再做：
+
+```text
+Reference(x,y) - Source(x,y)
+```
+
+因为 pair 未对齐。
+
+而是：
+
+```text
+Source face chroma
+↔
+Reference face chroma
+
+Source sky
+↔
+Reference sky
+
+Source vegetation
+↔
+Reference vegetation
+```
+
+得到：
+
+```text
+Δab_face
+Δab_skin
+Δab_sky
+Δab_vegetation
+...
+```
+
+然后检查这些区域是否形成一致的 Camera color direction。
+
+如果多个语义区方向一致：
+
+```text
+color confidence ↑
+```
+
+如果：
+
+```text
+face warm
+sky cool
+vegetation random
+```
+
+则：
+
+```text
+color confidence ↓
+甚至 gate off
+```
+
+Reference color gate 一旦关闭，Proposal color 也完全失去使用权限。fileciteturn1file0
+
+---
+
+# 十、Stage 9：Target Reliability
+
+因为 Reference 和 Source framing 不同，所以 Direct branch 也不是所有统计都同样可信。
+
+特别是 global histogram。
+
+例如：
+
+```text
+Reference:
+sky 50%
+person 5%
+
+Source:
+sky 10%
+person 35%
+```
+
+Global histogram 差异很大，但不一定是 Camera Tone 差异。
+
+于是系统计算：
+
+```text
+composition_similarity
+```
+
+基于：
+
+```text
+human area
+face area
+sky area
+vegetation area
+background area
+```
+
+再决定：
+
+```text
+global target reliability
+```
+
+因此最终逻辑是：
+
+```text
+composition 越近
+→ global tone 越可信
+
+composition 差越大
+→ semantic region / relationship 权重更高
+```
+
+fileciteturn1file0
+
+---
+
+# 十一、Stage 10：Direct Candidate
+
+Direct 分支完全不依赖 Generator：
+
+```text
+Direct Reference Target
+        ↓
+Direct Optimizer
+        ↓
+RenderSpec_direct
+        ↓
+Renderer(Source)
+        ↓
+Direct Candidate
+```
+
+它是整个系统的 fidelity baseline。
+
+---
+
+# 十二、Stage 11：VLM Diagnosis
+
+同时另一条分支进入 VLM。
+
+输入本质上是：
+
+```text
+Source
+Reference
++
+Direct deterministic statistics
+```
+
+VLM 被明确告知：
+
+```text
+same scene
+BUT NOT spatially aligned
+```
+
+因此禁止：
+
+```text
+same-coordinate comparison
+```
+
+VLM 的职责是：
+
+```text
+解释风格差异
++
+提出 image-specific editing strategy
+```
+
+而不是直接输出：
+
+```text
+Exposure = 0.43
+Curve = ...
+```
+
+即：
+
+```text
+VLM = planner
+not numeric authority
+```
+
+fileciteturn2file0
+
+---
+
+# 十三、Stage 12：Generative Proposal
+
+Generator 接收：
+
+```text
+IMAGE_1 = Source
+IMAGE_2 = Reference style
+```
+
+目标：
+
+```text
+Content(P) ≈ Source
+Geometry(P) ≈ Source
+Style(P) ≈ Reference
+```
+
+这一步本质是在做：
+
+> 把不对齐 Reference 的风格，重新表达在 Source 的坐标系上。
+
+所以 Proposal 最大价值不是：
+
+```text
+它是一个更漂亮的 GT
+```
+
+而是：
+
+```text
+它告诉系统：
+Reference 的风格如果落到 Source 上，
+空间上大概应该怎么调整。
+```
+
+Raw Proposal 绝对不是 final GT。fileciteturn0file0
+
+---
+
+# 十四、Stage 13：Proposal Style Evidence
+
+Raw Proposal 会被重新拆成**安全的低频 style evidence**：
+
+```text
+Proposal
+   ↓
+Evidence Extractor
+```
+
+得到四类核心证据：
+
+```text
+1. Spatial ΔEV
+2. Region ΔEV
+3. Relationship Δ
+4. Chroma Δ
+```
+
+---
+
+## Spatial
+
+例如：
+
+```text
+┌─────┬─────┬─────┐
+│+0.1 │+0.2 │+0.0 │
+├─────┼─────┼─────┤
+│+0.3 │+0.4 │-0.1 │
+├─────┼─────┼─────┤
+│ 0.0 │-0.2 │-0.3 │
+└─────┴─────┴─────┘ EV
+```
+
+告诉 Renderer：
+
+```text
+Source 坐标中
+哪里应该局部变亮/变暗
+```
+
+---
+
+## Region
+
+例如：
+
+```text
+face             +0.42 EV
+body_skin        +0.25 EV
+human_non_skin   +0.18 EV
+sky              -0.30 EV
+background       -0.08 EV
+```
+
+---
+
+## Relationship
+
+例如：
+
+```text
+face-background
+Proposal suggests:
++0.35 EV relative change
+```
+
+---
+
+## Color
+
+例如：
+
+```text
+Proposal low-frequency OKLab
+Δa = +0.012
+Δb = +0.018
+```
+
+但必须：
+
+```text
+Direct color_gate == enabled
+```
+
+Proposal 才能使用。
+
+---
+
+# 十五、Stage 14：Proposal Confidence
+
+系统还判断：
+
+> 这个 Proposal 的风格证据到底能信多少？
+
+当前质量项包括：
+
+```text
+detail_preservation_score
+supported_region_ratio
+confidence
+```
+
+如果 Proposal 高频变化太大：
+
+```text
+detail_preservation ↓
+confidence ↓
+```
+
+这符合 Source-Locked 原则：
+
+> Proposal 越像在“重画图”，它作为 photometric evidence 的可信度越低。
+
+fileciteturn2file0
+
+---
+
+# 十六、Stage 15：Full Hybrid Optimizer
+
+这里是真正的 Hybrid。
+
+不是：
+
+```text
+Direct image
++
+Proposal image
+```
+
+也不是 RGB blending。
+
+而是：
+
+```text
+Reference Target
++
+Proposal Style Evidence
+        ↓
+RenderSpec optimization
+```
+
+目标大致可以理解为：
+
+\[
+L =
+L_{Reference}
++
+C_P L_{Proposal}
++
+L_{preserve}
++
+L_{regularize}
+\]
+
+其中 Reference 包含：
+
+```text
+Global
+Region
+Relationship
+Color
+```
+
+Proposal 包含：
+
+```text
+Spatial
+Region
+Relationship
+Color
+```
+
+但 Proposal 的所有项：
+
+```text
+× proposal confidence
+```
+
+Reference 始终拥有更高 authority。
+
+这也正对应你后来继续研究的思路：
+
+```text
+Direct = WHAT
+Proposal = WHERE / HOW
+Source = STRUCTURE
+Renderer = FINAL PIXELS
+```
+
+fileciteturn0file2
+
+---
+
+# 十七、Stage 16：Source-Locked Renderer
+
+不论 Direct 还是 Hybrid，最终都必须走同一个 Renderer：
+
+```text
+Source
+  ↓
+Exposure
+  ↓
+Global Tone Curve
+  ↓
+Local Tone
+  ↓
+Semantic residual curves
+  ↓
+Spatial smooth gain
+  ↓
+bounded Color
+  ↓
+Candidate
+```
+
+尤其是：
+
+```text
+Proposal pixels
+```
+
+**永远不会进入最终 RGB。**
+
+Renderer 允许改变：
+
+```text
+Tone
+low-frequency Color
+smooth regional rendering
+```
+
+但不负责：
+
+```text
+texture generation
+object generation
+detail reconstruction
+```
+
+这正是原始 SPEC 对 PGT 最重要的冻结原则。fileciteturn0file0
+
+---
+
+# 十八、Stage 17：Qualification
+
+每个 Candidate 生成后不会直接入选。
+
+系统检查：
+
+```text
+Reference anchor 是否改善
+semantic region 是否改善
+relationship 是否改善
+color 是否合理
+clipping 是否恶化
+black crush 是否恶化
+参数是否过强
+```
+
+特别是 Global gate 已变为 reliability-aware。
+
+即：
+
+```text
+global_reliability 高
+→ global mismatch 可以 blocking
+
+global_reliability 低
+→ global 只作为 soft evidence
+```
+
+这样不会因为 Source / Reference framing 不同误杀正确结果。fileciteturn2file0
+
+---
+
+# 十九、Stage 18：Hierarchical Selector
+
+最后 Selector 的 authority 仍然是：
+
+```text
+Reference
+```
+
+而不是：
+
+```text
+Proposal
+```
+
+即：
+
+```text
+Proposal loss 不参与最终“谁最正确”的定义。
+```
+
+主要根据：
+
+```text
+Reference anchor
+region fidelity
+relationship fidelity
+color
+clipping
+modification strength
+roughness
+```
+
+进行选择。
+
+最终：
+
+```text
+Final PGT
+=
+Renderer(Source, selected RenderSpec)
+```
+
+---
+
+# 二十、可视化 Pipeline
+
+当前主要入口是：
+
+```text
+pipeline_report.html
+```
+
+路径：
+
+```text
+<output_dir>/<sample_id>/visualization/pipeline_report.html
+```
+
+它按照**真实生产数据流**组织，而不是单纯 dump debug 图。fileciteturn2file0
+
+---
+
+# 二十一、可视化中具体有哪些图像
+
+当前目录大致是：
+
+```text
+visualization/
+├── pipeline_report.html
+├── 00_source_reference.png
+├── 01_pair_compatibility.json
+├── 02_source_log_luma.png
+├── 02_reference_log_luma.png
+├── 03_person_region_matches.json
+├── 04_pair_specific_target.json
+├── 04_global_quantiles.png
+├── raw_proposal_*.png
+├── proposal_*_luma_grid.png
+├── proposal_*_evidence.json
+├── candidate_*.png
+├── candidate_*_tone_curve.png
+├── candidate_*_spatial_gain.png
+├── candidate_*_objective.json
+├── candidate_*_qualification.json
+└── final_comparison.png
+```
+
+fileciteturn2file0
+
+下面重点解释**真正的图像类 visualization**。
+
+---
+
+# 1. `00_source_reference.png`
+
+最基础的并排图：
+
+```text
+┌─────────────────┬─────────────────┐
+│     Source      │    Reference    │
+│     B_out       │    A_GT_ref     │
+└─────────────────┴─────────────────┘
+```
+
+主要看：
+
+```text
+两张图是否确实同场景
+framing 差多少
+人物 scale / position 差多少
+Reference 的影调直观差异是什么
+```
+
+这是所有后续统计解释的视觉基准。
+
+---
+
+# 2. `02_source_log_luma.png`
+
+显示：
+
+```text
+Source log luminance
+```
+
+而不是普通 RGB。
+
+它主要帮助观察：
+
+```text
+暗部
+中间调
+高光
+局部亮度分布
+```
+
+例如可以直观看到：
+
+```text
+Source 人脸是不是偏暗
+天空是否接近 clipping
+背景是不是过重
+```
+
+---
+
+# 3. `02_reference_log_luma.png`
+
+同样显示 Reference 的 log-luma。
+
+于是可以把：
+
+```text
+Source log-luma
+Reference log-luma
+```
+
+并排看。
+
+这里不是要求 pixel 对齐，而是帮助理解：
+
+```text
+Reference 的亮度层级是什么
+```
+
+例如：
+
+```text
+Reference 人脸更亮
+Reference background 更压
+Reference sky roll-off 更柔
+```
+
+---
+
+# 4. Semantic visualization
+
+语义 debug 目录包含：
+
+```text
+semantic_overlay.png
+
+person_instances.png
+
+person_0.png
+person_1.png
+...
+
+face.png
+skin.png
+sky.png
+vegetation.png
+
+analysis_partitions.png
+```
+
+这也是 0810 segmentation SPEC 明确要求的 debug 输出。fileciteturn0file1
+
+---
+
+## `semantic_overlay.png`
+
+大致表示：
+
+```text
+原图
++
+不同 semantic mask overlay
+```
+
+用来看：
+
+```text
+人有没有识别错
+sky 有没有污染建筑
+vegetation 有没有吞掉背景
+face / skin 是否合理
+```
+
+---
+
+## `person_instances.png`
+
+主要针对多人。
+
+例如：
+
+```text
+person_0
+person_1
+person_2
+```
+
+使用不同实例标记。
+
+它用来检查：
+
+```text
+两个人有没有被合并
+一个人有没有被拆碎
+instance 数量是否合理
+```
+
+---
+
+## `face.png`
+
+只显示 face mask。
+
+主要用于检查：
+
+```text
+人脸 Tone statistic 采样区域是否正确
+```
+
+---
+
+## `skin.png`
+
+显示：
+
+```text
+face skin
++
+body skin
+```
+
+后续会进一步拆成：
+
+```text
+face
+body_skin
+```
+
+---
+
+## `sky.png`
+
+检查天空区域。
+
+重点不是边界 pixel-perfect，而是：
+
+```text
+sky highlight percentile
+sky tone statistics
+```
+
+是否来自正确区域。
+
+---
+
+## `vegetation.png`
+
+显示：
+
+```text
+tree
+grass
+plant
+flower
+palm
+```
+
+聚合后的 vegetation mask。
+
+用于判断：
+
+```text
+绿色背景区域的 Tone / Color target
+```
+
+---
+
+# 5. `analysis_partitions.png`
+
+这是比普通 semantic mask 更重要的一张。
+
+它显示的是**真正参与优化的互斥区域**：
+
+```text
+face
+body_skin
+human_non_skin
+sky
+vegetation
+background
+```
+
+视觉上应该类似：
+
+```text
+┌──────────────────────┐
+│ sky                  │
+│                      │
+│     face             │
+│    body_skin         │
+│  human_non_skin      │
+│                      │
+│ vegetation   bg      │
+└──────────────────────┘
+```
+
+它直接回答：
+
+> 每个 pixel 最终算在哪个 semantic loss 里？
+
+这是排查 region double counting 最有价值的一张图。
+
+---
+
+# 6. `04_global_quantiles.png`
+
+这是 Tone target 的量化图。
+
+通常比较：
+
+```text
+Source quantile curve
+Reference quantile curve
+```
+
+例如：
+
+```text
+p05
+p10
+p25
+p50
+p75
+p90
+p95
+```
+
+主要看：
+
+```text
+Shadow 差多少
+Midtone 差多少
+Highlight 差多少
+```
+
+它是在解释最终：
+
+```text
+Global Tone Curve
+```
+
+应该长成什么样。
+
+---
+
+# 7. `raw_proposal_*.png`
+
+这是每个 Generator 输出的原始 Proposal。
+
+生产设置可为：
+
+```text
+3 strategies × 4 seeds
+= 12 proposals
+```
+
+视觉上可以直接比较：
+
+```text
+Proposal 0
+Proposal 1
+...
+```
+
+主要不是看：
+
+```text
+哪张最好看
+```
+
+而是看：
+
+```text
+是否确实把 Reference style 投到了 Source coordinate
+有没有错误重光
+有没有改人物
+有没有 texture hallucination
+不同 seed 风格是否稳定
+```
+
+Raw Proposal 只用于证据分析，不是最终 PGT。fileciteturn2file0
+
+---
+
+# 8. `proposal_*_luma_grid.png`
+
+这是目前最关键的 Proposal visualization 之一。
+
+它不是显示 Proposal RGB，而是显示：
+
+```text
+Proposal - Source
+```
+
+的低频空间 ΔEV。
+
+可以理解为一张：
+
+```text
+“Proposal 希望 Source 哪些区域变亮/变暗”
+```
+
+的 heatmap。
+
+例如：
+
+```text
+人物区域      +0.4 EV
+天空          -0.3 EV
+右下背景      -0.1 EV
+左侧墙面      +0.1 EV
+```
+
+因此它实际上把 Generator 从：
+
+```text
+RGB image generator
+```
+
+转换成了：
+
+```text
+Source-coordinate spatial style prior
+```
+
+这也是 Generator 分支最重要的存在价值。
+
+---
+
+# 9. Candidate 图像：`candidate_*.png`
+
+每个优化结果都会真正 Renderer 一张 Candidate。
+
+例如：
+
+```text
+candidate_direct.png
+
+candidate_hybrid_strategy0_seed0.png
+candidate_hybrid_strategy0_seed1.png
+...
+```
+
+这里看到的已经不是 Generative RGB。
+
+而是：
+
+```text
+Renderer(Source, RenderSpec)
+```
+
+所以它们都应该：
+
+```text
+geometry = Source
+texture = Source
+```
+
+只在：
+
+```text
+Tone / low-frequency Color
+```
+
+上不同。
+
+---
+
+# 10. `candidate_*_tone_curve.png`
+
+显示每个 Candidate 的 Tone transformation。
+
+大致会包括：
+
+```text
+input luminance
+→
+output luminance
+```
+
+可以检查：
+
+```text
+curve 是否单调
+shadow toe 是否过强
+midtone 是否整体抬太多
+highlight shoulder 是否过度
+```
+
+特别适合排查：
+
+```text
+为什么这张 Candidate 看起来奇怪？
+```
+
+到底是：
+
+```text
+Exposure
+Global Curve
+还是 semantic residual
+```
+
+造成的。
+
+---
+
+# 11. `candidate_*_spatial_gain.png`
+
+显示 Renderer 的 smooth spatial gain field。
+
+例如：
+
+```text
++0.3 EV      人物附近
+-0.15 EV     天空
+0 EV         中间背景
+```
+
+它与：
+
+```text
+proposal_*_luma_grid.png
+```
+
+是一对非常重要的诊断图。
+
+可以比较：
+
+```text
+Proposal 建议怎么调
+vs
+Renderer 最终接受了多少
+```
+
+如果 Proposal 要：
+
+```text
+face +1.5 EV
+```
+
+但 Reference target 只支持：
+
+```text
+face +0.3 EV
+```
+
+最终 spatial gain / semantic curve 应明显更接近 Reference，而不是跟着 Proposal 跑。
+
+---
+
+# 12. Final comparison：`final_comparison.png`
+
+这是最终最重要的一张结果图。
+
+应该至少包含：
+
+```text
+Source
+Reference
+Final PGT
+```
+
+实际诊断时最好理解成：
+
+```text
+┌──────────────┬──────────────┬──────────────┐
+│    Source    │  Reference   │  Final PGT   │
+│              │              │              │
+└──────────────┴──────────────┴──────────────┘
+```
+
+核心只判断两个问题：
+
+### Photofinishing
+
+```text
+Final 是否比 Source 更像 Reference？
+```
+
+包括：
+
+```text
+整体亮度
+人物亮度
+背景压暗
+sky highlight
+face-background relationship
+Color
+```
+
+### Source locking
+
+同时：
+
+```text
+Final 内容是不是仍然完全像 Source？
+```
+
+包括：
+
+```text
+脸
+文字
+建筑
+边缘
+纹理
+物体位置
+```
+
+---
+
+# 二十二、把可视化流程压缩成一条线
+
+最容易理解的是：
+
+```text
+① Source / Reference
+         ↓
+00_source_reference.png
+
+② 各自进入 luminance / semantic space
+         ↓
+source_log_luma
+reference_log_luma
+semantic_overlay
+person_instances
+face / skin / sky / vegetation
+analysis_partitions
+
+③ 建立 Direct target
+         ↓
+global_quantiles
+region statistics
+relationship statistics
+color consensus
+reliability
+
+④ Generator 提出 Source-coordinate style hypothesis
+         ↓
+raw_proposal_*.png
+         ↓
+proposal_*_luma_grid.png
+region ΔEV
+relationship Δ
+chroma Δ
+confidence
+
+⑤ Optimizer 求 RenderSpec
+         ↓
+candidate_*.png
+candidate_*_tone_curve.png
+candidate_*_spatial_gain.png
+
+⑥ Qualification / Selector
+         ↓
+final_comparison.png
+```
+
+---
+
+# 二十三、真正看结果时，我建议按这个顺序看
+
+不要从一堆 JSON 开始。
+
+**第一眼先看 5 组图：**
+
+1. `Source vs Reference`：确认真实任务难度；
+2. `semantic_overlay + analysis_partitions`：确认统计区域有没有错；
+3. `raw_proposal + proposal luma grid`：看 Generator 到底提供了什么额外信息；
+4. `candidate + tone curve + spatial gain`：看 Hybrid 是否把 Proposal evidence 正确投影成 photometric operation；
+5. `final_comparison`：最终只回答——**是否更像 Reference，同时仍然还是 Source。**
+
+因此整个 visualization 的核心逻辑其实也是：
+
+```text
+Reference 告诉我们 WHAT
+        ↓
+Proposal 告诉我们 WHERE / HOW
+        ↓
+Renderer 展示最终真正用了什么
+        ↓
+Final comparison 验证结果
+```
+
+当前 visualization 文档明确也是按照 production data flow 排布，并且 visualization 本身**只负责观察，不参与 optimizer、target authority 或 final selection**。fileciteturn2file0
+
+最值得重点看的其实不是 Raw Proposal 本身，而是这组三联：
+
+```text
+Proposal ΔEV Grid
+        ↓
+Candidate Spatial Gain / Semantic Curve
+        ↓
+Final Candidate
+```
+
+它能最直接判断目前这个 Hybrid V1 是否真的实现了预期的 **“Generator 提供空间 style prior，但 Reference 最终控制落点”**。
