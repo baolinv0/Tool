@@ -1,1318 +1,484 @@
-基于你刚才的环境失败结果，以及当前 `feature/complete-reference-style-pgt` 分支代码，我建议不要继续围绕 NATTEN 做版本兼容，而是把 **OneFormer 的实现路径改成不依赖 DiNAT/NATTEN 的 HuggingFace Swin backend**。
-
-还有一个更重要的问题：当前远端 `semantic_regions.py` 里的生产语义路径实际上还是旧结构——`GroundingDINO + SAM2.1 + SCHP + OneFormer sky-only`，并没有完整落实 0810SEGSPEC 里冻结的：
-
-```text
-OneFormer
-= 主 Panoptic segmentation
-= person instances + sky + vegetation
-
-SAM2.1
-= 低质量 person refinement
-
-Face/Skin parser
-= face / skin
-```
-
-当前代码中 `OneFormerADE20KSkyParser` 甚至只抽取 `sky`，而 person 仍来自 Grounding DINO。 这与 0810SEGSPEC 的最终设计并不一致。
-
-因此这次不应该只做“把 DiNAT checkpoint 换成 Swin checkpoint”这么小的 patch，而应该顺势把 segmentation backend **真正收敛到 0810SEGSPEC**。
-
----
-
-# 一、最终修改目标
-
-修改前：
-
-```text
-Grounding DINO
-   ↓
-person boxes
-   ↓
-SAM2.1
-   ↓
-human masks
-
-SCHP
-   ↓
-face / skin
-
-OneFormer DiNAT
-   ↓
-sky only
-```
-
-修改后：
-
-```text
-                     Image
-                       │
-             ┌─────────┴─────────┐
-             ▼                   ▼
-       OneFormer-Swin       Face/Skin Parser
-         Panoptic                │
-             │                   ├─ face
-      ┌──────┼───────┐           └─ skin
-      ▼      ▼       ▼
-   person   sky   vegetation
-     │
-     ▼
-Person Quality Check
-     │
-  good ──────────────┐
-                     │
-  bad                │
-   ↓                 │
- SAM2.1              │
- refinement          │
-   └─────────┬───────┘
-             ▼
-       Person Instances
-             │
-             ▼
- Face/Skin ↔ Person association
-             │
-             ▼
- aggregate masks
- +
- exclusive analysis partitions
- +
- interior ROI
-             │
-             ▼
- InstanceAwareSemanticBundle
-```
-
-这一结构和 0810SEGSPEC 完全一致：OneFormer 是主场景/实例理解，SAM2.1 只修坏 person mask。
-
----
-
-# 二、Task 1：替换 OneFormer backend
-
-## 当前问题
-
-当前：
-
-```python
-class OneFormerADE20KSkyParser(_LazyLocalBackend):
-```
-
-职责只有：
-
-```python
-sky_probability()
-```
-
-而且注释直接写：
-
-```text
-OneFormer ADE20K DiNAT-L
-```
-
-建议删除这个类，改成：
-
-```python
-class OneFormerPanopticBackend(_LazyLocalBackend):
-```
-
-接口：
-
-```python
-@dataclass
-class OneFormerPanopticOutput:
-    persons: list[RawPersonInstance]
-    sky: np.ndarray
-    vegetation: np.ndarray
-    fine_grained_masks: dict[str, np.ndarray]
-```
-
-主接口：
-
-```python
-class OneFormerPanopticBackend:
-
-    def analyze(
-        self,
-        image: np.ndarray,
-    ) -> OneFormerPanopticOutput:
-        ...
-```
-
----
-
-# 三、Task 2：默认 checkpoint 改成 Swin
-
-不要继续使用：
-
-```text
-OneFormer + DiNAT
-       ↓
-NATTEN
-```
-
-默认改成：
-
-```text
-OneFormer + Swin
-```
-
-建议配置：
-
-```yaml
-semantic_segmentation:
-
-  oneformer:
-    enabled: true
-    backend: huggingface
-    model: shi-labs/oneformer_ade20k_swin_tiny
-    task: panoptic
-
-    device: cuda
-    dtype: bfloat16
-```
-
-第一版优先：
-
-```text
-Swin-Tiny
-```
-
-原因不是它理论性能最高，而是目前首先需要验证：
-
-```text
-person instance
-sky
-vegetation
-```
-
-对 Tone Statistics 是否稳定。
-
-如果真实数据验证发现不足：
-
-```text
-Swin-Tiny
-   ↓
-Swin-Large
-```
-
-只换 checkpoint，不改 architecture。
-
----
-
-# 四、Task 3：彻底移除 NATTEN mandatory dependency
-
-需要检查所有：
-
-```text
-requirements
-environment
-Docker
-README
-model setup docs
-runtime check
-```
-
-删除：
-
-```text
-natten
-dinat
-```
-
-作为强制依赖。
-
-生产路径不再出现：
-
-```python
-import natten
-```
-
-也不应该出现：
-
-```text
-NATTEN wheel installation
-CUDA architecture compatibility
-```
-
-这样的 setup prerequisite。
-
-新的运行依赖收敛成：
-
-```text
-torch
-transformers
-Pillow
-numpy
-SAM2.1 dependencies
-face/skin parser dependencies
-```
-
-核心目标就是：
-
-> Blackwell 环境不再因为 OneFormer segmentation 编译 CUDA extension。
-
----
-
-# 五、Task 4：OneFormer 改成真正 Panoptic inference
-
-当前代码：
-
-```python
-task_inputs=["semantic"]
-```
-
-然后：
-
-```python
-post_process_semantic_segmentation(...)
-```
-
-需要改成：
-
-```python
-task_inputs=["panoptic"]
-```
-
-逻辑：
-
-```python
-outputs = model(**inputs)
-
-panoptic = processor.post_process_panoptic_segmentation(
-    outputs,
-    target_sizes=[image.shape[:2]],
-)[0]
-```
-
-然后获得：
-
-```text
-segmentation
-segments_info
-```
-
-遍历：
-
-```python
-for segment in segments_info:
-    segment_id = segment["id"]
-    label_id = segment["label_id"]
-
-    label = id2label[label_id]
-```
-
----
-
-# 六、Task 5：从 OneFormer 直接构建 person instances
-
-删除当前 person 主路径：
-
-```text
-Grounding DINO
-→ person box
-→ SAM2
-```
-
-换成：
-
-```text
-OneFormer panoptic
-→ person segments
-→ person_i
-```
-
-建议数据结构：
-
-```python
-@dataclass
-class PersonInstance:
-    instance_id: int
-
-    mask: np.ndarray
-    interior_mask: np.ndarray
-
-    bbox: tuple[int, int, int, int]
-    area_ratio: float
-    confidence: float
-
-    source_segment_id: int
-
-    face_mask: np.ndarray | None = None
-    skin_mask: np.ndarray | None = None
-
-    refined_by_sam: bool = False
-```
-
-和 SPEC 定义保持一致。
-
----
-
-# 七、Task 6：Grounding DINO 从生产 segmentation path 删除
-
-这次建议不是保留成 fallback，而是直接移出 PGT segmentation 主流程。
-
-删除：
-
-```python
-HumanDetector
-GroundingDINOHumanDetector
-text_prompt
-box_threshold
-text_threshold
-nms_iou_threshold
-```
-
-因为现在：
-
-```text
-OneFormer person instance
-```
-
-已经负责人物发现。
-
-否则会重新出现 0810SEGSPEC 明确禁止的职责重复：
-
-```text
-OneFormer person
-+
-Grounding DINO person
-+
-SAM person
-```
-
-
-
----
-
-# 八、Task 7：SAM2.1 从“默认 segmenter”改成 conditional refiner
-
-这是非常重要的一步。
-
-当前：
-
-```text
-Grounding DINO box
-→ 每个人都跑 SAM
-```
-
-要改成：
-
-```text
-OneFormer person
-→ quality check
-→ only bad masks → SAM2.1
-```
-
-新增：
-
-```python
-def needs_sam_refine(
-    person: PersonInstance,
-    config: PersonRefineConfig,
-) -> bool:
-```
-
-第一版只需要几个简单规则：
-
-```text
-confidence
-connected component count
-bbox occupancy
-area ratio
-compactness
-```
-
-例如：
-
-```python
-if person.confidence < min_confidence:
-    return True
-
-if connected_component_count(person.mask) > max_components:
-    return True
-
-if bbox_occupancy(person.mask, person.bbox) < min_bbox_occupancy:
-    return True
-```
-
-不要再继续增加复杂 quality model。
-
----
-
-# 九、Task 8：SAM2.1 输入改成 OneFormer coarse instance
-
-推荐：
-
-```text
-Image
-+
-OneFormer bbox
-+
-optional coarse person mask
-```
-
-输出：
-
-```text
-refined_mask
-```
-
-然后只做必要 sanity check：
-
-```text
-与原 bbox overlap 合理
-面积没有异常变化
-没有明显吞并其他 person
-```
-
-如果失败：
-
-```python
-person.mask = original_oneformer_mask
-person.refined_by_sam = False
-```
-
-这也是 SPEC 中冻结的 fallback。
-
----
-
-# 十、Task 9：SAM2.1 模型改 Base+
-
-当前代码类名：
-
-```python
-SAM21HieraLargeSegmenter
-```
-
-建议改成通用：
-
-```python
-SAM21PersonRefiner
-```
-
-默认配置：
-
-```yaml
-sam21:
-  enabled: true
-  refine_only: true
-  model_size: base_plus
-```
-
-不要把 Large 固定进 class 名。
-
-因为 SAM 只是 fallback，不是主 segmentation backbone。
-
----
-
-# 十一、Task 10：OneFormer 同时输出 sky + vegetation
-
-当前 OneFormer 只提取：
-
-```text
-sky
-```
-
-需要增加：
-
-```python
-VEGETATION_LABELS = {
-    "tree",
-    "grass",
-    "plant",
-    "flower",
-    "palm",
+# 近五年静音机器人行走方案中的“噪声 Proxy”变量
+
+## 核心结论
+
+我把近五年、尤其 **2025–2026 年明确以 quiet / low-noise locomotion 为目标**的代表性工作重新按“**训练时到底拿什么量来代表噪声**”梳理了一遍。一个很明显的结论是：**真正直接把麦克风 dBA 放进低层行走控制目标的论文很少，主流仍然是用脚—地接触的物理变量做代理。** 目前最常见的是 **落脚速度 / 接触速度**，随后发展到 **接触力 / 垂直 GRF**，以及 **落脚瞬间速度突变量 \(\Delta v\)**；还有一类工作并不定义单一 proxy，而是同时降低步频、落脚速度、机身高频振荡和控制器刚度。citeturn19search0turn23search0turn17search0
+
+更值得注意的是一个技术演进趋势：
+
+\[
+\boxed{
+\text{落脚速度}
+\rightarrow
+\text{落脚速度+接触力}
+\rightarrow
+\text{预测 GRF}
+\rightarrow
+\text{更完整的接触/柔顺模型}
 }
-```
+\]
 
-运行：
+也就是说，研究正在从**“容易从仿真拿到的运动学 proxy”**，逐渐走向**“更接近真实声源机理的动力学 proxy”**。citeturn22view0turn20view3
 
-```python
-vegetation_mask = np.zeros((h, w), dtype=np.float32)
+## 代表性论文与噪声 Proxy 对照
 
-for segment in segments:
-    if label_name in VEGETATION_LABELS:
-        vegetation_mask = np.maximum(
-            vegetation_mask,
-            segment_mask,
-        )
-```
+| 论文 | 机器人 | 真正用于静音设计/训练的 noise proxy | 麦克风的角色 | 关键结果 |
+|---|---|---|---|---|
+| **Learning Quiet Walking for a Small Home Robot**, ICRA 2025 | Sony aibo，小型四足 | **Foot contact velocity，落脚接触速度** | 实机最终验证声音 | 明确称 foot contact velocity 为 footstep sound proxy；RL 对其逐步施加 penalty。citeturn19search0turn19search4 |
+| **QuietPaw: Learning Quadrupedal Locomotion with Versatile Noise Preference Alignment**, 2025 | Unitree Go2 四足 | **Impact velocity + contact force** | 实机 SPL 验证 | 将脚地冲击噪声建模为接触力与撞击速度共同决定的 noise cost，并实现可调静音程度。citeturn23search0turn17search4 |
+| **MUTE: Minimizing Acoustic Noise: Enhancing Quiet Locomotion for Quadruped Robots**, IROS 2025 | Unitree Go1 | **脚落地前的 drop-foot velocity / impact velocity** | 20 Hz SPL sensor，测 dBA | 从 \(E=\frac12mv^2\) 建立落脚速度与 impact sound 的关系；平均约 **8 dBA** 降噪。citeturn21view0 |
+| **Human-Centered Development of Guide Dog Robots: Quiet and Stable Locomotion Control**, 2025 / ICRA 2026 | Unitree Go1 | **低步频 + 低 touchdown velocity + 低机身高频振荡 + 较低 \(K_d\)**，不是单一 scalar proxy | 人耳高度 dB 测量 | 1 m/s 下约 **10 dB** 降低；作者明确关联高频 stepping、振动和噪声。citeturn22view2turn20view1 |
+| **Olaf: Bringing an Animated Character to Life in the Physical World**, 2025–2026 | Disney 双足角色机器人 | **脚在重力方向的速度变化 \(\Delta v_z\)** | 实机声学评价 | impact reward 直接惩罚相邻仿真时刻脚的垂直速度变化，从而降低 impact noise。citeturn22view3 |
+| **QuietWalk: Physics-Informed RL for GRF-Aware Humanoid Locomotion**, 2026 | Unitree G1 人形 | **预测的左右脚垂直 GRF \(F_z\)** | 48 kHz 麦克风最终评价 | GRF \(R^2\) 提升至约 0.99；实机平均噪声下降 **7.17 dB**、峰值下降 **4.98 dB**。citeturn17search0turn22view0turn22view1 |
+| **Impact-aware compliant foot placement for quiet humanoid locomotion via RL**, 2026 | 人形 | **foot-ground impact / virtual compliance**，更接近接触模型而非简单一个传感量 | SPL 最终评价 | 构建 foot-corner contact model 与 virtual compliance，平均 SPL 降低 **4.88 dB**。citeturn20view3 |
 
-同时保留：
+这里有一个很重要的区分：
 
-```python
-fine_grained_masks = {
-    "tree": ...,
-    "grass": ...,
-    "plant": ...,
-    ...
+> **“论文测了麦克风” ≠ “麦克风就是该论文的 noise proxy”。**
+
+多数工作实际上是：
+
+\[
+\text{训练阶段：物理 proxy}
+\quad\rightarrow\quad
+\text{实机阶段：麦克风验证}
+\]
+
+例如 Sony 的方法训练的是 foot contact velocity，MUTE 训练的是落脚速度，QuietWalk 训练的是预测 GRF；**麦克风 dB 是最终 ground truth evaluation，而不是低层 policy 的主要 reward。** citeturn19search0turn21view0turn22view1
+
+## 主流 Proxy 实际可以归成几类
+
+### 落脚速度是目前最典型的 Proxy
+
+Sony 2025 的定义最直接：
+
+\[
+v_{\text{contact}}
+\]
+
+也就是：
+
+> **脚碰到地面的瞬间，脚还在以多大的速度向地面运动。**
+
+Sony 直接把 foot contact velocity 称为与 footstep sound 高度相关的 proxy，并在 curriculum RL 中逐渐增加这一项的 penalty。citeturn19search0turn19search2
+
+MUTE 基本采用同样的物理逻辑，但公式解释得更清楚：
+
+\[
+E_{\text{impact}}
+=
+\frac{1}{2}mv_{\text{impact}}^2
+\]
+
+并基于 impact acoustics 的近似关系：
+
+\[
+A_{\text{sound}}\propto\sqrt{E_{\text{impact}}}
+\]
+
+于是：
+
+\[
+A_{\text{sound}}
+\propto
+v_{\text{impact}}
+\]
+
+因此作者直接在**即将接触地面之前**约束脚下降速度，而不是在仿真里模拟声场。citeturn21view0
+
+MUTE 的具体 reward 中甚至明确有：
+
+\[
+r_{\mathrm{drop}}
+\propto
+-v_{\mathrm{foot,drop}}^2
+\]
+
+而且随着步态 phase 接近落地时刻，惩罚更强。citeturn21view0
+
+所以第一类可以总结为：
+
+\[
+\boxed{\text{Noise Proxy A: touchdown/contact velocity}}
+\]
+
+这是目前**最成熟、最简单、最容易在 simulator 使用**的一类。
+
+### 接触力与 GRF 是更接近声源机理的一类
+
+QuietPaw 比单纯 velocity 更进一步：
+
+\[
+\boxed{
+\text{noise proxy}
+=
+f(v_{\text{impact}}, F_{\text{contact}})
 }
-```
+\]
 
-但 Renderer / statistics 默认只消费：
+原因是脚步碰撞声音不仅取决于“撞得多快”，也取决于碰撞过程中形成的**接触力峰值和冲击过程**。QuietPaw 因此把 impact velocity 和 contact force 同时放入 noise cost，而不是只有速度。citeturn17search4turn23search0
 
-```text
-vegetation
-```
+到了 QuietWalk，则进一步把核心变量收敛到：
 
-这与 SPEC 一致。
+\[
+f_z^L,\quad f_z^R
+\]
 
----
+即左右脚的**垂直地面反作用力 GRF**。其 quiet reward 为：
 
-# 十二、Task 11：Face/Skin parser 保留独立职责
+\[
+r_{\mathrm{impact}}
+=
+-\alpha
+\left[
+(f_z^L)^2+(f_z^R)^2
+\right]
+\]
 
-这里不要让 OneFormer 顺便接管 face / skin。
+也就是说：
 
-继续：
+> **脚落地时地面反推机器人的力越大，静音 reward 越差。**
 
-```text
-Lightweight Face/Skin Parser
-```
+citeturn22view1
 
-输出：
+特别值得注意的是，QuietWalk 也意识到 GRF sensor 不适合成为实际部署依赖，因此没有要求部署时安装脚底力传感器，而是用：
 
-```text
-face
-skin
-face_skin
-body_skin
-```
+\[
+[q,\dot q,\ddot q]_{t-5:t}
+\rightarrow
+\hat F_z^L,\hat F_z^R
+\]
 
-然后：
+从关节位置、速度、加速度历史**预测 GRF**。使用 6 帧、50 Hz，也就是 0.12 s 的历史窗口。citeturn22view0
 
-```python
-person.face_mask = global_face & person.mask
-person.skin_mask = global_skin & person.mask
-```
+其动力学约束是：
 
-多人时 face component 优先采用：
+\[
+M(q)\ddot q+C(q,\dot q)\dot q+G(q)
+=
+\tau_{\mathrm{eff}}+J_n^Tf
+\]
 
-```text
-face center inside person
-+
-face-person overlap
-```
+所以 QuietWalk 本质上代表了一个明显趋势：
 
-进行 assignment。
+> **从“运动学 proxy”升级到“估计的物理接触力 proxy”。**
 
----
+citeturn22view0
 
-# 十三、Task 12：建立真正的 InstanceAwareSemanticBundle
+### 速度突变或“冲击率”是另一种思路
 
-建议不要继续只输出目前：
+Disney 的 Olaf 没有直接惩罚 GRF，而是用：
 
-```python
-SemanticRegionSet
-```
+\[
+\Delta v_{i,z}
+=
+v_{i,z}(t)-v_{i,z}(t-1)
+\]
 
-而新增：
+也就是**脚在竖直方向上的速度突然变化量**。
 
-```python
-@dataclass
-class InstanceAwareSemanticBundle:
-    image_height: int
-    image_width: int
+其 sound suppression reward：
 
-    persons: list[PersonInstance]
+\[
+r_{\text{sound}}
+=
+-
+\sum_{i\in\{L,R\}}
+\min
+\left(
+\Delta v_{i,z}^{2},
+\Delta v_{\max}^{2}
+\right)
+\]
 
-    human: np.ndarray
-    face: np.ndarray
-    skin: np.ndarray
+citeturn22view3
 
-    sky: np.ndarray
-    vegetation: np.ndarray
-    background: np.ndarray
-
-    analysis_face: np.ndarray
-    analysis_body_skin: np.ndarray
-    analysis_human_non_skin: np.ndarray
-    analysis_sky: np.ndarray
-    analysis_vegetation: np.ndarray
-    analysis_background: np.ndarray
-
-    quality: SemanticQualityReport
-```
-
-
-
-但是为了避免一次修改整个 V4 pipeline，可以保留：
-
-```python
-bundle.to_legacy_region_set()
-```
-
-提供：
+直观上：
 
 ```text
-human
-face
-skin
-sky
-background
-```
-
-给现有代码。
-
-所以这里推荐：
-
-```text
-新接口成为 truth
-↓
-legacy adapter 保兼容
-```
-
-而不是反过来。
-
----
-
-# 十四、Task 13：构建 aggregate human
-
-直接：
-
-```python
-human = union(
-    person.mask
-    for person in persons
-)
-```
-
-而不是再跑一个独立 human segmentation model。
-
-这解决两个问题：
-
-```text
-instance masks 与 aggregate human 天然一致
-person count 与 human area 天然一致
-```
-
----
-
-# 十五、Task 14：增加互斥 analysis partitions
-
-这是 PGT 真正使用的 mask。
-
-构建：
-
-```python
-analysis_face = face
-
-analysis_body_skin = (
-    skin
-    * (1 - face)
-)
-
-analysis_human_non_skin = (
-    human
-    * (1 - skin)
-)
-
-analysis_vegetation = (
-    vegetation
-    * (1 - human)
-)
-
-analysis_sky = (
-    sky
-    * (1 - human)
-    * (1 - vegetation)
-)
-
-analysis_background = (
-    1
-    - human
-    - sky
-    - vegetation
-)
-```
-
-最终：
-
-```text
-face
-body_skin
-human_non_skin
-vegetation
-sky
-background
-```
-
-尽量互斥。
-
-这一部分直接服务：
-
-```text
-Region Tone
-Region Color
-Relationship loss
-```
-
-而不是 segmentation benchmark。
-
----
-
-# 十六、Task 15：Interior ROI
-
-新增统一函数：
-
-```python
-def build_interior_mask(
-    mask: np.ndarray,
-    erode_ratio: float,
-) -> np.ndarray:
-```
-
-不要使用固定像素：
-
-```text
-erode 5px
-```
-
-而使用：
-
-```text
-relative to image size / region size
-```
-
-最终：
-
-```text
-full mask
-→ visualization / association
-
-interior mask
-→ statistics
-```
-
-例如：
-
-```text
-face median
-skin chroma
-human EV
-sky highlight
-vegetation tone
-```
-
-全部默认使用 interior。
-
----
-
-# 十七、Task 16：SemanticQualityReport
-
-新增：
-
-```python
-@dataclass
-class SemanticQualityReport:
-    person_count: int
-    person_confidence: tuple[float, ...]
-
-    face_count: int
-    face_person_assignment_confidence: float
-
-    human_area_ratio: float
-    face_area_ratio: float
-    skin_area_ratio: float
-    sky_area_ratio: float
-    vegetation_area_ratio: float
-
-    sam_refined_person_count: int
-
-    warnings: tuple[str, ...]
-```
-
-但是不要把 rubric 做得太复杂。
-
-后续只需要能够判断：
-
-```text
-use
-lower weight
-skip
-```
-
-即可。
-
----
-
-# 十八、Task 17：配置重写
-
-当前 `SegmentationConfig` 里包含：
-
-```text
-text_prompt
-box_threshold
-text_threshold
-NMS
-```
-
-这些都是 Grounding DINO 遗留。
-
-建议改成：
-
-```python
-@dataclass
-class OneFormerConfig:
-    model_path: str
-    task: str = "panoptic"
-    device: str = "cuda"
-    dtype: str = "bfloat16"
-
-    min_person_area_ratio: float = 5e-4
-    min_region_area_ratio: float = 1e-5
-```
-
-```python
-@dataclass
-class PersonRefineConfig:
-    enabled: bool = True
-    min_confidence: float = 0.5
-    max_component_count: int = 3
-    min_bbox_occupancy: float = 0.15
-```
-
-```python
-@dataclass
-class SemanticSegmentationConfig:
-    oneformer: OneFormerConfig
-    person_refine: PersonRefineConfig
-    ...
-```
-
----
-
-# 十九、Task 18：不要在代码里写死 DiNAT
-
-必须全文搜索：
-
-```text
-dinat
-natten
-DiNAT-L
-```
-
-生产代码、README、sample config 中全部去掉。
-
-OneFormer backend 只应该知道：
-
-```text
-checkpoint path
-```
-
-例如：
-
-```python
-OneFormerProcessor.from_pretrained(model_path)
-OneFormerForUniversalSegmentation.from_pretrained(model_path)
-```
-
-它不应该知道 backbone 是：
-
-```text
-Swin
-ConvNeXt
-DiNAT
-```
-
-这样未来换 Swin-L 完全不需要改代码。
-
----
-
-# 二十、Task 19：错误信息必须保留真实原因
-
-当前 `_LazyLocalBackend`：
-
-```python
-except Exception:
-    raise RuntimeError(
-        f"local backend unavailable: ..."
-    ) from None
-```
-
-会把真正的问题隐藏掉。
-
-这对你这次 NATTEN 问题定位非常不利。
-
-改成：
-
-```python
-except Exception as exc:
-    raise RuntimeError(
-        f"OneFormer backend failed: {exc}"
-    ) from exc
-```
-
-这是正常工程可诊断性，不需要设计复杂 exception framework。
-
-至少应该让：
-
-```text
-CUDA architecture sm_120 unsupported
-```
-
-这样的真实错误能够看到。
-
----
-
-# 二十一、Task 20：Source / Reference 必须复用同一 producer
-
-V4 pipeline：
-
-```python
-semantic_producer.analyze(source)
-semantic_producer.analyze(reference)
-```
-
-两个调用必须完全相同。
-
-不能：
-
-```text
-Source → Swin
-Reference → DiNAT
-```
-
-也不能：
-
-```text
-Source → OneFormer
-Reference → fallback SegFormer
-```
-
-否则 region statistics 会有系统偏差。
-
-这是 0810SEGSPEC 的明确 contract。
-
----
-
-# 二十二、测试修改
-
-## Test A — OneFormer backend 不依赖 NATTEN
-
-测试重点不是：
-
-```python
-assert "natten" not in pip
-```
-
-而是代码级：
-
-```text
-mock OneFormer Swin
-→ initialize
-→ panoptic inference
-→ 不 import natten
-```
-
----
-
-## Test B — Panoptic person instance
-
-合成：
-
-```text
-person_0
-person_1
-sky
-tree
-```
-
-mock OneFormer output。
-
-要求：
-
-```python
-len(bundle.persons) == 2
-```
-
-并且：
-
-```text
-human = person0 ∪ person1
-```
-
----
-
-## Test C — Vegetation aggregation
-
-输入：
-
-```text
-tree
-grass
-plant
-```
-
-要求：
-
-```text
-vegetation =
-tree ∪ grass ∪ plant
-```
-
----
-
-## Test D — SAM only bad instance
-
-构造：
-
-```text
-person_0 confidence=0.95
-person_1 confidence=0.30
-```
-
-要求：
-
-```text
-SAM calls == 1
-```
-
-而不是 2。
-
----
-
-## Test E — SAM failure fallback
-
-SAM 抛异常：
-
-```text
-person.mask == original OneFormer mask
-```
-
-pipeline 继续。
-
----
-
-## Test F — Face/person association
-
-两个人 + 两张脸。
-
-确认：
-
-```text
-face0 → person0
-face1 → person1
-```
-
----
-
-## Test G — Analysis partitions mutually exclusive
-
-确认：
-
-```text
-face ∩ body_skin == 0
-
-body_skin ∩ human_non_skin == 0
-
-human ∩ vegetation == 0
-```
-
-在 threshold 后成立。
-
----
-
-## Test H — Empty person is valid
-
-没有人：
-
-```text
-persons = []
-human = empty
-face = empty
-skin = empty
-```
-
-不报错。
-
----
-
-# 二十三、真实 smoke test
-
-这比 unit test 更重要。
-
-至少准备：
-
-```text
-10 单人大人像
-10 多人
-10 小人物/远景人物
-10 天空
-10 vegetation
-```
-
-重点统计：
-
-```text
-person detection success
-
-person merge error
-
-person fragmentation
-
-SAM refinement ratio
-
-face-person assignment error
-
-sky obvious false positive
-
-vegetation obvious false positive
-```
-
-但最终项目级指标应该是：
-
-```text
-mask perturbation
+脚高速向下
       ↓
-face median luminance 变化多少
-human EV 变化多少
-sky highlight P95 变化多少
-vegetation median 变化多少
+接触地面
+      ↓
+速度瞬间从 -1 m/s → 0
+      ↓
+Δv 很大
+      ↓
+说明发生猛烈碰撞
 ```
 
-因为 segmentation 模块的目的本来就不是追求 segmentation leaderboard，而是给 Tone/Color Statistics 提供稳定 ROI。
+因此这里的 proxy 不是：
 
----
+\[
+v
+\]
 
-# 二十四、建议文件修改清单
+而更接近：
 
-| 文件                                 | 修改                                                                        |
-| ---------------------------------- | ------------------------------------------------------------------------- |
-| `semantic_regions.py`              | **核心重构**：OneFormer Panoptic + person/sky/vegetation；删除 Grounding DINO 主路径 |
-| `__init__.py`                      | export 新 `InstanceAwareSemanticBundle` / `PersonInstance`                 |
-| `v4_pipeline.py`                   | Source/Reference 统一调用新 producer                                           |
-| `v4_style.py`                      | statistics 优先消费 analysis partitions / interior ROI                        |
-| `v4_visualization.py`              | 增加 person instances、vegetation、partitions、SAM-refined 标记                  |
-| runtime config                     | checkpoint 改为 OneFormer Swin                                              |
-| dependency 文件                      | 移除 NATTEN / DiNAT mandatory dependency                                    |
-| `tests/...semantic...`             | panoptic/person/SAM fallback/vegetation/partitions tests                  |
-| `tests/test_reference_style_v4.py` | 确认 V4 target 可消费新 semantic bundle                                         |
-| README / setup docs                | 删除 NATTEN Blackwell 安装要求                                                  |
+\[
+\boxed{\Delta v/\Delta t \approx a_{\text{impact}}}
+\]
 
----
+也就是**冲击加速度/冲击瞬态**。
 
-# 二十五、Builder 实施顺序
+这一思路非常值得注意，因为它已经开始向你之前提到的：
 
-不要一次性把整个 pipeline 改烂。
+> IMU / 三轴加速度 / structural vibration
 
-建议严格：
+靠近，只不过 Olaf 的 \(\Delta v_z\) 来自仿真脚部运动状态，而不是实际粘在脚上的 accelerometer。citeturn22view3
+
+### 步频、机身振动和控制器参数属于“工程型 Proxy”
+
+Guide Dog Robot 这篇比较特殊。
+
+它没有写出：
+
+\[
+Noise=f(x)
+\]
+
+然后把某个 \(x\) 当唯一 reward。
+
+它的静音策略更像一个**proxy bundle**：
+
+\[
+\boxed{
+\text{低步频}
++
+\text{低落脚速度}
++
+\text{低高频机体振荡}
++
+\text{低 }K_d
+}
+\]
+
+作者发现较高的 derivative gain \(K_d\) 会导致更明显的 motor winding noise，因此平地把 \(K_d\) 调到 0.5；同时把 swing trajectory 的 **65% 时间分配给向下运动**，目的是让落脚更慢。citeturn22view2
+
+同时，他们观察到默认 controller 的高频 stepping 会诱发 excessive vibration 并放大 noise；提出的方法通过更低步频、更长步长和更平滑的 body velocity 来减少这种声音。在 1 m/s 时，新 controller 单步约 0.32 m，而默认 controller 约 0.12 m，并最终实测约 10 dB 降低。citeturn20view1turn22view2
+
+因此这篇实际上引出了两个更宽泛的 noise proxy：
+
+\[
+\boxed{\text{step/contact event rate}}
+\]
+
+以及：
+
+\[
+\boxed{\text{body vibration / velocity oscillation}}
+\]
+
+不过严格来说，它们在这篇中是**控制设计启发量和解释变量**，而不是像 QuietWalk 的 GRF 那样明确进入 noise cost 的单一 scalar proxy。citeturn20view1
+
+## 哪些你之前提到的变量其实还没有成为主流
+
+把这批**明确以机器人静音行走为核心目标**的论文放在一起，一个很有意思的结果是：
+
+| 你关心的变量 | 近年 quiet-walking 论文中的状态 |
+|---|---|
+| **Foot contact / touchdown velocity** | ★★★★★ **最主流** |
+| **Contact force / vertical GRF** | ★★★★☆ **快速上升** |
+| **\(\Delta v\) / impact acceleration** | ★★★☆☆ 已开始出现 |
+| **步频 / contact-event rate** | ★★★☆☆ 工程方案中出现 |
+| **机身振动 / body velocity oscillation** | ★★☆☆☆ 被观察和压制，但很少直接作为核心 noise reward |
+| **IMU 三轴加速度** | ★★☆☆☆ 经常作为 robot state 输入，**但很少直接当 noise proxy** |
+| **结构加速度频谱 / vibration PSD** | ★☆☆☆☆ 在机器振动声学里很常见，但在最新 legged quiet locomotion RL 中尚不是主流 |
+| **关节 torque / current** | ★☆☆☆☆ 通常用于能耗/平滑/温升 regularization，而非直接 footstep-noise proxy |
+| **麦克风 SPL / dBA** | ★★★★★ 最终评价非常常见；**训练 proxy 却不常见** |
+| **音频短时能量 / spectral centroid / loudness** | ★☆☆☆☆ 在这批 quiet locomotion 控制论文里基本还没有成为核心 RL proxy |
+
+这里需要特别避免一个误区：**IMU 出现在 policy input 中，并不等于 IMU 是 noise proxy。** 例如 MUTE 的 policy observation 包含角速度、gravity vector、关节角和关节速度，但它真正针对 quietness 施加惩罚的变量仍然是 drop-foot velocity；QuietWalk 输入 \(q,\dot q,\ddot q\)，最终则把这些量转换成 GRF，再由 GRF 构造 impact reward。citeturn21view0turn22view0
+
+这意味着从“专门研究噪声 proxy”的角度看，**IMU vibration、结构振动谱、关节电流、音频频谱特征其实反而是尚未被近年静音 locomotion 论文充分挖掘的空间**。这是基于上述文献分布做出的研究判断，而不是说这些变量与声学无关。citeturn19search0turn23search0turn17search0
+
+## 近五年真正的技术演进
+
+如果只看论文名字容易觉得大家都在做“quiet walking”，但从 proxy 的选择来看，其实有很清晰的路线。
+
+最早的一类思想是：
+
+\[
+\text{footstep sound}
+\approx
+\text{foot landing velocity}
+\]
+
+因此：
 
 ```text
-Task 1
-OneFormer Swin Panoptic backend
-↓
-mock tests
-
-Task 2
-person / sky / vegetation extraction
-↓
-tests
-
-Task 3
-InstanceAwareSemanticBundle
-↓
-tests
-
-Task 4
-conditional SAM2.1 refinement
-↓
-tests
-
-Task 5
-face / skin person association
-↓
-tests
-
-Task 6
-aggregate + exclusive partitions + interior ROI
-↓
-tests
-
-Task 7
-legacy SemanticRegionSet adapter
-↓
-旧 V4 tests green
-
-Task 8
-pipeline integration
-↓
-full tests
-
-Task 9
-dependency cleanup
-NATTEN / DiNAT removal
-↓
-Blackwell runtime smoke
-
-Task 10
-real-image segmentation smoke
-↓
-Tone Statistics stability test
+2025 Sony
+contact velocity
+      ↓
+2025 MUTE
+phase-aware pre-contact velocity
 ```
 
----
+它的最大优势是**仿真中极容易获得、没有 sensor noise、每个脚每个 timestep 都能算**。citeturn19search0turn21view0
 
-# 二十六、这次明确不要做什么
+然后 QuietPaw 开始变成：
 
-不要因为 OneFormer 环境问题又扩大模型栈：
+\[
+\text{Noise}
+\approx
+f(v_{\text{impact}},F_{\text{contact}})
+\]
+
+即：
+
+> **只知道撞多快不够，还得知道撞多重。**
+
+citeturn23search0turn17search4
+
+到 QuietWalk：
+
+\[
+[q,\dot q,\ddot q]
+\rightarrow
+\hat F_z
+\rightarrow
+r_{\text{quiet}}
+\]
+
+开始解决一个关键工程矛盾：
+
+> **GRF 比 velocity 更接近物理声源，但 force sensor 不适合长期部署，那就把 GRF 估出来。**
+
+其 GRF predictor 在 held-out real-robot 数据上把左右脚 \(R^2\) 从纯监督模型约 0.39/0.67 提升至约 0.99/0.99，同时实机实现平均 A-weighted noise 下降 7.17 dB。citeturn17search0turn22view0
+
+2026 年的 humanoid 工作又进一步出现：
+
+\[
+\text{contact model}
++
+\text{virtual compliance}
+\]
+
+不是简单压一个 force peak，而是试图**改变整个 foot-ground contact transient**；近期 *Impact-aware compliant foot placement* 报告平均 SPL 减少 4.88 dB。citeturn20view3
+
+所以我会把近五年的演进概括成：
+
+\[
+\boxed{
+\underbrace{v_{\text{touchdown}}}_{容易测}
+\rightarrow
+\underbrace{v+F}_{更物理}
+\rightarrow
+\underbrace{\hat F_z}_{可部署动力学 proxy}
+\rightarrow
+\underbrace{\text{contact transient / compliance model}}_{更完整的接触声源模型}
+}
+\]
+
+## 对“哪一个 Proxy 最值得继续研究”的判断
+
+从机器人低层控制角度，这几种 proxy 并不是简单的谁更好，而是处在不同的**因果距离**上：
 
 ```text
-不要改回 Grounding DINO 主 person detector
-不要加 SegFormer person
-不要加 SAM3
-不要加 Grounded-SAM
-不要加 open-vocabulary detector
-不要加 ReID
-不要加 matting
-不要训练新的 segmentation model
+机器人动作
+  │
+  ├─ 脚下降速度 v
+  │
+  ▼
+接触瞬态
+  │
+  ├─ Δv / acceleration
+  ├─ GRF / force peak
+  ├─ impulse
+  │
+  ▼
+结构振动
+  │
+  ├─ foot acceleration
+  ├─ body vibration
+  ├─ vibration spectrum
+  │
+  ▼
+声辐射
+  │
+  ▼
+麦克风 SPL / spectrum
+  │
+  ▼
+房间传播
+  │
+  ▼
+人耳实际感知
 ```
 
-同样也不要继续：
+离机器人动作越近，比如：
 
-```text
-试 natten 0.18
-试 natten 0.19
-试各种 CUDA flags
-```
+\[
+v_{\text{touchdown}}
+\]
 
-这会继续把时间耗在一个对 PGT 没有核心价值的依赖上。
+越容易控制、越容易做 RL reward，但与真实声音之间隔了很多物理过程。
 
----
+越靠后，比如：
 
-# 最终推荐方案
+\[
+SPL_{\text{mic}}
+\]
 
-这次修改应该定义成：
+越接近最终目标，但也越容易受到：
 
-> **不是“让旧 DiNAT OneFormer 支持 Blackwell”，而是把当前 segmentation 实现修正成真正符合 0810SEGSPEC 的 OneFormer-Swin Panoptic architecture。**
+- 地板材质；
+- 房间混响；
+- 麦克风位置；
+- 电机声；
+- 风扇声；
+- 人说话；
+- 其他机器；
+- 背景噪声
 
-最终代码结构：
+污染。
 
-```text
-OneFormer-Swin
-    ↓
-Panoptic
-    ├─ person instances
-    ├─ sky
-    └─ vegetation
-          ↓
-bad person only
-          ↓
-SAM2.1 Base+
-          ↓
+QuietWalk 实际上是在寻找中间的平衡点：
 
-Face/Skin Parser
-          ↓
+\[
+\boxed{\text{GRF}}
+\]
 
-InstanceAwareSemanticBundle
-          ↓
-exclusive interior ROI
-          ↓
-Tone / Color Statistics
-```
+既比 foot velocity 更接近**冲击声的物理原因**，又不像麦克风那样被房间声学严重耦合。citeturn22view0turn22view1
 
-这样同时解决两个问题：
+但是，从你的研究视角，我认为这里反而暴露出了一个很明显的空白：
 
-1. **工程问题**：完全绕开当前 `NATTEN × Blackwell sm_120` blocker；
-2. **架构问题**：把当前仍然存在的 `Grounding DINO + SAM2 + SCHP + OneFormer sky-only` 旧生产路径真正修正成 0810SEGSPEC 冻结架构。当前远端分支 HEAD 是 `300b8a66...`。
+> **现有 quiet locomotion 文献大多在 “foot kinematics → contact dynamics” 这一级做 proxy，但“contact dynamics → structural vibration → acoustic radiation”这一段还没有被充分利用。**
 
-另外，整个修改不会影响 PGT 的核心原则：semantic segmentation 只是为区域 Tone/Color Statistics 提供 ROI；最终 PGT 仍由 Source-Locked Photometric Renderer 从 Source 生成。
+例如完全可以研究：
+
+\[
+\boxed{
+P=
+[
+v_{\text{touchdown}},
+\hat F_z,
+a_{\text{foot}},
+a_{\text{body}},
+PSD_{\text{vib}},
+\tau/I
+]
+}
+\]
+
+再通过真实声音学习：
+
+\[
+\hat L_A
+=
+f(P,\text{floor})
+\]
+
+其中：
+
+\[
+\hat L_A
+\]
+
+不一定作为低层 RL 每一步直接 reward，而可以成为一个**可微/可在线估计的 acoustic proxy model**。
+
+这与当前“只用 GRF”的思路有明显差别：**GRF 解释“脚撞得重不重”，IMU/结构振动则开始解释“这次撞击究竟有多少机械能真的进入了机器人—地板系统并形成了可辐射振动”。** 从现有 2025–2026 静音 locomotion 论文的 proxy 分布来看，这一层目前明显没有 touchdown velocity 和 GRF 那么拥挤。citeturn21view0turn22view0turn22view3
+
+最终可以把当前文献格局压缩为一句话：
+
+> **近五年静音机器人行走中，最核心的 noise proxy 不是麦克风，而是“落脚冲击”的物理代理：2025 年以 foot contact/touchdown velocity 为主，随后扩展到 impact velocity + contact force，2026 年进一步出现 predicted vertical GRF、\(\Delta v_z\) 和 compliant contact model；IMU 振动谱、结构加速度、关节电流以及高级音频特征目前还没有成为这一方向的主流控制 proxy。** citeturn19search0turn23search0turn21view0turn17search0turn20view3
