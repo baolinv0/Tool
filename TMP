@@ -1,484 +1,415 @@
-# 近五年静音机器人行走方案中的“噪声 Proxy”变量
+可以用一个非常具体的家庭场景作为“外衣”：
 
-## 核心结论
+> **夜间，家庭服务机器人端着一杯水，从客厅走到卧室。家人正在睡觉，机器人既不能停下来，也不能因为刻意走得很慢而严重影响任务效率，同时还要尽量避免脚步声把人吵醒。**
 
-我把近五年、尤其 **2025–2026 年明确以 quiet / low-noise locomotion 为目标**的代表性工作重新按“**训练时到底拿什么量来代表噪声**”梳理了一遍。一个很明显的结论是：**真正直接把麦克风 dBA 放进低层行走控制目标的论文很少，主流仍然是用脚—地接触的物理变量做代理。** 目前最常见的是 **落脚速度 / 接触速度**，随后发展到 **接触力 / 垂直 GRF**，以及 **落脚瞬间速度突变量 \(\Delta v\)**；还有一类工作并不定义单一 proxy，而是同时降低步频、落脚速度、机身高频振荡和控制器刚度。citeturn19search0turn23search0turn17search0
+用这个场景解释图，专利人员基本不需要懂强化学习、motion tracking，也能理解我们为什么要这样设计。
 
-更值得注意的是一个技术演进趋势：
+---
 
-\[
-\boxed{
-\text{落脚速度}
-\rightarrow
-\text{落脚速度+接触力}
-\rightarrow
-\text{预测 GRF}
-\rightarrow
-\text{更完整的接触/柔顺模型}
-}
-\]
+# 1. 先讲传统方案：机器人通常是“走了以后才知道这一脚重不重”
 
-也就是说，研究正在从**“容易从仿真拿到的运动学 proxy”**，逐渐走向**“更接近真实声源机理的动力学 proxy”**。citeturn22view0turn20view3
+普通机器人收到：
 
-## 代表性论文与噪声 Proxy 对照
+> “向前走，速度 0.5 m/s。”
 
-| 论文 | 机器人 | 真正用于静音设计/训练的 noise proxy | 麦克风的角色 | 关键结果 |
-|---|---|---|---|---|
-| **Learning Quiet Walking for a Small Home Robot**, ICRA 2025 | Sony aibo，小型四足 | **Foot contact velocity，落脚接触速度** | 实机最终验证声音 | 明确称 foot contact velocity 为 footstep sound proxy；RL 对其逐步施加 penalty。citeturn19search0turn19search4 |
-| **QuietPaw: Learning Quadrupedal Locomotion with Versatile Noise Preference Alignment**, 2025 | Unitree Go2 四足 | **Impact velocity + contact force** | 实机 SPL 验证 | 将脚地冲击噪声建模为接触力与撞击速度共同决定的 noise cost，并实现可调静音程度。citeturn23search0turn17search4 |
-| **MUTE: Minimizing Acoustic Noise: Enhancing Quiet Locomotion for Quadruped Robots**, IROS 2025 | Unitree Go1 | **脚落地前的 drop-foot velocity / impact velocity** | 20 Hz SPL sensor，测 dBA | 从 \(E=\frac12mv^2\) 建立落脚速度与 impact sound 的关系；平均约 **8 dBA** 降噪。citeturn21view0 |
-| **Human-Centered Development of Guide Dog Robots: Quiet and Stable Locomotion Control**, 2025 / ICRA 2026 | Unitree Go1 | **低步频 + 低 touchdown velocity + 低机身高频振荡 + 较低 \(K_d\)**，不是单一 scalar proxy | 人耳高度 dB 测量 | 1 m/s 下约 **10 dB** 降低；作者明确关联高频 stepping、振动和噪声。citeturn22view2turn20view1 |
-| **Olaf: Bringing an Animated Character to Life in the Physical World**, 2025–2026 | Disney 双足角色机器人 | **脚在重力方向的速度变化 \(\Delta v_z\)** | 实机声学评价 | impact reward 直接惩罚相邻仿真时刻脚的垂直速度变化，从而降低 impact noise。citeturn22view3 |
-| **QuietWalk: Physics-Informed RL for GRF-Aware Humanoid Locomotion**, 2026 | Unitree G1 人形 | **预测的左右脚垂直 GRF \(F_z\)** | 48 kHz 麦克风最终评价 | GRF \(R^2\) 提升至约 0.99；实机平均噪声下降 **7.17 dB**、峰值下降 **4.98 dB**。citeturn17search0turn22view0turn22view1 |
-| **Impact-aware compliant foot placement for quiet humanoid locomotion via RL**, 2026 | 人形 | **foot-ground impact / virtual compliance**，更接近接触模型而非简单一个传感量 | SPL 最终评价 | 构建 foot-corner contact model 与 virtual compliance，平均 SPL 降低 **4.88 dB**。citeturn20view3 |
-
-这里有一个很重要的区分：
-
-> **“论文测了麦克风” ≠ “麦克风就是该论文的 noise proxy”。**
-
-多数工作实际上是：
-
-\[
-\text{训练阶段：物理 proxy}
-\quad\rightarrow\quad
-\text{实机阶段：麦克风验证}
-\]
-
-例如 Sony 的方法训练的是 foot contact velocity，MUTE 训练的是落脚速度，QuietWalk 训练的是预测 GRF；**麦克风 dB 是最终 ground truth evaluation，而不是低层 policy 的主要 reward。** citeturn19search0turn21view0turn22view1
-
-## 主流 Proxy 实际可以归成几类
-
-### 落脚速度是目前最典型的 Proxy
-
-Sony 2025 的定义最直接：
-
-\[
-v_{\text{contact}}
-\]
-
-也就是：
-
-> **脚碰到地面的瞬间，脚还在以多大的速度向地面运动。**
-
-Sony 直接把 foot contact velocity 称为与 footstep sound 高度相关的 proxy，并在 curriculum RL 中逐渐增加这一项的 penalty。citeturn19search0turn19search2
-
-MUTE 基本采用同样的物理逻辑，但公式解释得更清楚：
-
-\[
-E_{\text{impact}}
-=
-\frac{1}{2}mv_{\text{impact}}^2
-\]
-
-并基于 impact acoustics 的近似关系：
-
-\[
-A_{\text{sound}}\propto\sqrt{E_{\text{impact}}}
-\]
-
-于是：
-
-\[
-A_{\text{sound}}
-\propto
-v_{\text{impact}}
-\]
-
-因此作者直接在**即将接触地面之前**约束脚下降速度，而不是在仿真里模拟声场。citeturn21view0
-
-MUTE 的具体 reward 中甚至明确有：
-
-\[
-r_{\mathrm{drop}}
-\propto
--v_{\mathrm{foot,drop}}^2
-\]
-
-而且随着步态 phase 接近落地时刻，惩罚更强。citeturn21view0
-
-所以第一类可以总结为：
-
-\[
-\boxed{\text{Noise Proxy A: touchdown/contact velocity}}
-\]
-
-这是目前**最成熟、最简单、最容易在 simulator 使用**的一类。
-
-### 接触力与 GRF 是更接近声源机理的一类
-
-QuietPaw 比单纯 velocity 更进一步：
-
-\[
-\boxed{
-\text{noise proxy}
-=
-f(v_{\text{impact}}, F_{\text{contact}})
-}
-\]
-
-原因是脚步碰撞声音不仅取决于“撞得多快”，也取决于碰撞过程中形成的**接触力峰值和冲击过程**。QuietPaw 因此把 impact velocity 和 contact force 同时放入 noise cost，而不是只有速度。citeturn17search4turn23search0
-
-到了 QuietWalk，则进一步把核心变量收敛到：
-
-\[
-f_z^L,\quad f_z^R
-\]
-
-即左右脚的**垂直地面反作用力 GRF**。其 quiet reward 为：
-
-\[
-r_{\mathrm{impact}}
-=
--\alpha
-\left[
-(f_z^L)^2+(f_z^R)^2
-\right]
-\]
-
-也就是说：
-
-> **脚落地时地面反推机器人的力越大，静音 reward 越差。**
-
-citeturn22view1
-
-特别值得注意的是，QuietWalk 也意识到 GRF sensor 不适合成为实际部署依赖，因此没有要求部署时安装脚底力传感器，而是用：
-
-\[
-[q,\dot q,\ddot q]_{t-5:t}
-\rightarrow
-\hat F_z^L,\hat F_z^R
-\]
-
-从关节位置、速度、加速度历史**预测 GRF**。使用 6 帧、50 Hz，也就是 0.12 s 的历史窗口。citeturn22view0
-
-其动力学约束是：
-
-\[
-M(q)\ddot q+C(q,\dot q)\dot q+G(q)
-=
-\tau_{\mathrm{eff}}+J_n^Tf
-\]
-
-所以 QuietWalk 本质上代表了一个明显趋势：
-
-> **从“运动学 proxy”升级到“估计的物理接触力 proxy”。**
-
-citeturn22view0
-
-### 速度突变或“冲击率”是另一种思路
-
-Disney 的 Olaf 没有直接惩罚 GRF，而是用：
-
-\[
-\Delta v_{i,z}
-=
-v_{i,z}(t)-v_{i,z}(t-1)
-\]
-
-也就是**脚在竖直方向上的速度突然变化量**。
-
-其 sound suppression reward：
-
-\[
-r_{\text{sound}}
-=
--
-\sum_{i\in\{L,R\}}
-\min
-\left(
-\Delta v_{i,z}^{2},
-\Delta v_{\max}^{2}
-\right)
-\]
-
-citeturn22view3
-
-直观上：
+传统 locomotion controller 主要考虑：
 
 ```text
-脚高速向下
-      ↓
-接触地面
-      ↓
-速度瞬间从 -1 m/s → 0
-      ↓
-Δv 很大
-      ↓
-说明发生猛烈碰撞
+别摔倒
++
+保持目标速度
++
+完成行走
 ```
 
-因此这里的 proxy 不是：
+QuietWalk 又进一步增加：
 
-\[
-v
-\]
+> “如果某一次落脚产生的地面冲击力 GRF 太大，就在训练时惩罚它，让机器人逐渐学会踩轻一点。”
 
-而更接近：
+可以把它类比成人学走路：
 
-\[
-\boxed{\Delta v/\Delta t \approx a_{\text{impact}}}
-\]
+> **这一脚踩得太响了，下次记得轻一点。**
 
-也就是**冲击加速度/冲击瞬态**。
+这已经能够降低冲击，但它更偏向于：
 
-这一思路非常值得注意，因为它已经开始向你之前提到的：
+```text
+先产生动作
+    ↓
+发生落脚
+    ↓
+发现冲击比较大
+    ↓
+通过训练形成更好的策略
+```
 
-> IMU / 三轴加速度 / structural vibration
+我们的变化是：
 
-靠近，只不过 Olaf 的 \(\Delta v_z\) 来自仿真脚部运动状态，而不是实际粘在脚上的 accelerometer。citeturn22view3
+> **机器人不应该等脚踩下去之后才知道这一脚可能很响，而应该在落脚之前，就先想几种不同走法，判断哪一种未来后果最安静。**
 
-### 步频、机身振动和控制器参数属于“工程型 Proxy”
+这就是整张图最核心的逻辑。
 
-Guide Dog Robot 这篇比较特殊。
+---
 
-它没有写出：
+# 2. 图的上半部分：机器人先“想好怎么走”
 
-\[
-Noise=f(x)
-\]
+蓝色区域叫：
 
-然后把某个 \(x\) 当唯一 reward。
+## Quiet Motion Planning
 
-它的静音策略更像一个**proxy bundle**：
+回到刚才的夜间送水场景。
 
-\[
-\boxed{
-\text{低步频}
+机器人首先知道三类信息：
+
+```text
+我要往卧室走
 +
-\text{低落脚速度}
+我现在身体是什么状态
 +
-\text{低高频机体振荡}
-+
-\text{低 }K_d
-}
-\]
+前面是什么地面
+```
 
-作者发现较高的 derivative gain \(K_d\) 会导致更明显的 motor winding noise，因此平地把 \(K_d\) 调到 0.5；同时把 swing trajectory 的 **65% 时间分配给向下运动**，目的是让落脚更慢。citeturn22view2
+比如：
 
-同时，他们观察到默认 controller 的高频 stepping 会诱发 excessive vibration 并放大 noise；提出的方法通过更低步频、更长步长和更平滑的 body velocity 来减少这种声音。在 1 m/s 时，新 controller 单步约 0.32 m，而默认 controller 约 0.12 m，并最终实测约 10 dB 降低。citeturn20view1turn22view2
+> 当前机器人端着一杯水，前面先是木地板，再进入瓷砖区域。
 
-因此这篇实际上引出了两个更宽泛的 noise proxy：
+这些对应图左侧的 **Input Context**。
 
-\[
-\boxed{\text{step/contact event rate}}
-\]
+机器人不是马上迈腿，而是先进入 **Quiet Motion Generator**。
+
+可以把它理解成机器人脑子里的一个“动作设计师”。
+
+---
+
+# 3. Generator 不是只想一种走法，而是同时想几种
+
+例如机器人需要以同样速度向前走，它可以设想：
+
+### M1：正常走
+
+步幅比较大，和平常一样。
+
+### M2：小步快走
+
+缩短步幅，增加一点步频。
+
+### M3：降低身体上下起伏
+
+膝盖稍微弯一些，重心转移更柔和，脚落地前提前减速。
+
+### M4：另一种特殊步态
+
+可能更安静，但稳定性变差。
+
+这就是图中央非常醒目的：
+
+> **Candidate Future Motions：M1、M2、M3、M4**
+
+关键在于：
+
+> **它们都可以完成“以 0.5 m/s 向前走”这个任务，但产生的脚步声不一定一样。**
+
+所以我们把静音问题从：
+
+> “怎样修改当前这一脚？”
+
+提升成：
+
+> **“完成同一个任务，本来就存在多种未来走法，我应该选择哪一种？”**
+
+---
+
+# 4. 然后机器人在真正走之前，先预测“每一种走法会有什么后果”
+
+这对应橙色模块：
+
+## Future Consequence Prediction
+
+机器人分别问：
+
+> 如果我按照 M1 走，会发生什么？
+> 如果我按照 M2 走，会发生什么？
+> 如果按照 M3 呢？
+
+它不是只看动作“看起来轻不轻”，而是预测几个物理结果。
+
+图中的 **GRF**，可以给专利人员解释成：
+
+> **机器人脚踩到地面时，地面对机器人脚产生的反作用力。这个力突然升得很高，往往意味着落脚冲击比较大。**
+
+`Impact` 就是：
+
+> 落脚的一瞬间到底“砸”得重不重。
+
+`Noise` 就是：
+
+> 根据这种冲击和地面情况，预计会产生多大的脚步声。
+
+`Stability` 则保证：
+
+> 不能为了安静，把机器人走得快摔倒了。
+
+于是可能得到：
+
+```text
+M1
+冲击大、声音大、稳定
+
+M2
+冲击中等、声音中等、稳定
+
+M3
+冲击小、声音小、稳定
+
+M4
+声音也小，但稳定性不好
+```
+
+那系统自然选择 **M3**。
+
+这就是图中的：
+
+> **Select / Refine M***
+
+---
+
+# 5. 到这里为止，机器人只是“计划上认为会安静”
+
+这是理解下半部分最关键的一句话。
+
+假设机器人认为：
+
+> “木地板上采用 M3，预计这一脚 GRF 比较低，因此应该比较安静。”
+
+但真实世界不可能和模型完全一致。
+
+例如这块木地板下面恰好是空心的。
+
+或者：
+
+> 今天机器人端着一杯水，比训练时多了负载；鞋底也磨损了一些。
+
+那么：
+
+```text
+计划中的安静动作
+        ≠
+真实执行时一定安静
+```
+
+所以我们不能：
+
+```text
+Generator
+    ↓
+生成 quiet motion
+    ↓
+普通 Tracker
+    ↓
+结束
+```
+
+还需要图的下半部分。
+
+---
+
+# 6. 图的下半部分：真正踩下去的时候，还要“边走边修”
+
+绿色区域：
+
+## Quiet Motion Realization
+
+这里的 **Contact-Adaptive Tracker**，可以给专利人员解释成：
+
+> **Generator 负责告诉机器人“应该怎么走”，Tracker 负责让真实机器人在真实地面上把这种走法真正做出来。**
+
+例如 Generator 已经规划：
+
+> “右脚要很柔和地落到木地板。”
+
+但真实落脚的一瞬间，系统发现：
+
+> 实际冲击比预想的大。
+
+Tracker 就立即做一些很小的执行修正，比如：
+
+```text
+膝盖缓冲多一点
+踝关节更柔顺一点
+重量从左脚转到右脚再慢一点
+```
+
+它不会重新决定：
+
+> “我要不要换一种步态？”
+
+因为这个属于 Generator。
+
+它只解决：
+
+> **“既然已经决定这么走，怎样在真实接触条件下把它真正安静地做出来？”**
+
+这就是为什么图中把：
+
+```text
+Planning
+```
+
+和：
+
+```text
+Realization
+```
+
+明确拆成两层。
+
+---
+
+# 7. 图里最重要的是两条反馈箭头
+
+这两条箭头其实比 Generator、Tracker 本身还重要。
+
+## 绿色箭头：Fast realization correction
+
+比如右脚刚碰到地板，系统发现实际冲击偏大。
+
+这个时候没有时间重新规划未来几秒动作。
+
+所以 Tracker 在当前这一脚马上进行局部调整：
+
+> **“这一脚马上修正。”**
+
+这是毫秒到几十毫秒级的快速闭环。
+
+可以类比成年人夜里走路时：
+
+> 脚刚碰到一块比较硬的地板，身体会下意识把膝盖和脚踝放松一点。
+
+---
+
+## 橙色箭头：Slow consequence-driven replanning
+
+但如果机器人连续发现：
+
+> “我原来以为这种木地板采用 M3 会很安静，但实际每一步都比预测响。”
+
+那就说明：
+
+> **不是这一脚执行偶然出了问题，而是前面的运动规划本身不再适合当前环境。**
+
+因此把真实结果反馈到上层：
+
+```text
+原来规划：
+M3 最安静
+
+实际发现：
+M3 在这种地板上还是比较响
+
+↓
+
+Generator 下一步重新规划
+```
+
+例如下一步换成：
+
+> 更短步幅、更长双脚支撑时间、更慢的重量转移。
+
+这就是橙色的：
+
+> **Slow consequence-driven replanning**
+
+所以整个机器人不是：
+
+> “选一次动作，然后机械执行到底。”
+
+而是：
+
+> **提前预测 → 执行 → 看真实结果 → 快速修当前这一脚 + 慢速修改后面的走法。**
+
+---
+
+# 8. 用一句生活化的话解释整张图
+
+可以直接对专利人员说：
+
+> **就像人在夜里怕吵醒家人，不是等脚已经重重踩到地板以后才想办法，而是在迈腿之前就会提前选择更轻的步幅、落脚方式和重心转移方式；但真正踩到地板时，如果发现这块地板比想象中更硬、更响，身体又会立刻通过膝盖和脚踝做微调，并在后续几步进一步改变走法。我们的机器人就是把这种“提前想 + 落地修 + 后续再调整”的过程系统化。**
+
+这句话基本可以作为整张图的“场景解释”。
+
+---
+
+# 9. 但专业上，我们做的不只是“走轻一点”
+
+专利人员需要进一步意识到，这个方案包含一个比较明确的技术变化：
+
+**传统方法更偏向**
+
+[
+State + Velocity
+\rightarrow
+Action
+]
+
+通过 GRF reward 学出一个比较安静的 policy。
+
+而我们增加了显式的：
+
+[
+Future\ Motion
+]
 
 以及：
 
-\[
-\boxed{\text{body vibration / velocity oscillation}}
-\]
-
-不过严格来说，它们在这篇中是**控制设计启发量和解释变量**，而不是像 QuietWalk 的 GRF 那样明确进入 noise cost 的单一 scalar proxy。citeturn20view1
-
-## 哪些你之前提到的变量其实还没有成为主流
-
-把这批**明确以机器人静音行走为核心目标**的论文放在一起，一个很有意思的结果是：
-
-| 你关心的变量 | 近年 quiet-walking 论文中的状态 |
-|---|---|
-| **Foot contact / touchdown velocity** | ★★★★★ **最主流** |
-| **Contact force / vertical GRF** | ★★★★☆ **快速上升** |
-| **\(\Delta v\) / impact acceleration** | ★★★☆☆ 已开始出现 |
-| **步频 / contact-event rate** | ★★★☆☆ 工程方案中出现 |
-| **机身振动 / body velocity oscillation** | ★★☆☆☆ 被观察和压制，但很少直接作为核心 noise reward |
-| **IMU 三轴加速度** | ★★☆☆☆ 经常作为 robot state 输入，**但很少直接当 noise proxy** |
-| **结构加速度频谱 / vibration PSD** | ★☆☆☆☆ 在机器振动声学里很常见，但在最新 legged quiet locomotion RL 中尚不是主流 |
-| **关节 torque / current** | ★☆☆☆☆ 通常用于能耗/平滑/温升 regularization，而非直接 footstep-noise proxy |
-| **麦克风 SPL / dBA** | ★★★★★ 最终评价非常常见；**训练 proxy 却不常见** |
-| **音频短时能量 / spectral centroid / loudness** | ★☆☆☆☆ 在这批 quiet locomotion 控制论文里基本还没有成为核心 RL proxy |
-
-这里需要特别避免一个误区：**IMU 出现在 policy input 中，并不等于 IMU 是 noise proxy。** 例如 MUTE 的 policy observation 包含角速度、gravity vector、关节角和关节速度，但它真正针对 quietness 施加惩罚的变量仍然是 drop-foot velocity；QuietWalk 输入 \(q,\dot q,\ddot q\)，最终则把这些量转换成 GRF，再由 GRF 构造 impact reward。citeturn21view0turn22view0
-
-这意味着从“专门研究噪声 proxy”的角度看，**IMU vibration、结构振动谱、关节电流、音频频谱特征其实反而是尚未被近年静音 locomotion 论文充分挖掘的空间**。这是基于上述文献分布做出的研究判断，而不是说这些变量与声学无关。citeturn19search0turn23search0turn17search0
-
-## 近五年真正的技术演进
-
-如果只看论文名字容易觉得大家都在做“quiet walking”，但从 proxy 的选择来看，其实有很清晰的路线。
-
-最早的一类思想是：
-
-\[
-\text{footstep sound}
-\approx
-\text{foot landing velocity}
-\]
-
-因此：
-
-```text
-2025 Sony
-contact velocity
-      ↓
-2025 MUTE
-phase-aware pre-contact velocity
-```
-
-它的最大优势是**仿真中极容易获得、没有 sensor noise、每个脚每个 timestep 都能算**。citeturn19search0turn21view0
-
-然后 QuietPaw 开始变成：
-
-\[
-\text{Noise}
-\approx
-f(v_{\text{impact}},F_{\text{contact}})
-\]
-
-即：
-
-> **只知道撞多快不够，还得知道撞多重。**
-
-citeturn23search0turn17search4
-
-到 QuietWalk：
-
-\[
-[q,\dot q,\ddot q]
-\rightarrow
-\hat F_z
-\rightarrow
-r_{\text{quiet}}
-\]
-
-开始解决一个关键工程矛盾：
-
-> **GRF 比 velocity 更接近物理声源，但 force sensor 不适合长期部署，那就把 GRF 估出来。**
-
-其 GRF predictor 在 held-out real-robot 数据上把左右脚 \(R^2\) 从纯监督模型约 0.39/0.67 提升至约 0.99/0.99，同时实机实现平均 A-weighted noise 下降 7.17 dB。citeturn17search0turn22view0
-
-2026 年的 humanoid 工作又进一步出现：
-
-\[
-\text{contact model}
-+
-\text{virtual compliance}
-\]
-
-不是简单压一个 force peak，而是试图**改变整个 foot-ground contact transient**；近期 *Impact-aware compliant foot placement* 报告平均 SPL 减少 4.88 dB。citeturn20view3
-
-所以我会把近五年的演进概括成：
-
-\[
-\boxed{
-\underbrace{v_{\text{touchdown}}}_{容易测}
-\rightarrow
-\underbrace{v+F}_{更物理}
-\rightarrow
-\underbrace{\hat F_z}_{可部署动力学 proxy}
-\rightarrow
-\underbrace{\text{contact transient / compliance model}}_{更完整的接触声源模型}
-}
-\]
-
-## 对“哪一个 Proxy 最值得继续研究”的判断
-
-从机器人低层控制角度，这几种 proxy 并不是简单的谁更好，而是处在不同的**因果距离**上：
-
-```text
-机器人动作
-  │
-  ├─ 脚下降速度 v
-  │
-  ▼
-接触瞬态
-  │
-  ├─ Δv / acceleration
-  ├─ GRF / force peak
-  ├─ impulse
-  │
-  ▼
-结构振动
-  │
-  ├─ foot acceleration
-  ├─ body vibration
-  ├─ vibration spectrum
-  │
-  ▼
-声辐射
-  │
-  ▼
-麦克风 SPL / spectrum
-  │
-  ▼
-房间传播
-  │
-  ▼
-人耳实际感知
-```
-
-离机器人动作越近，比如：
-
-\[
-v_{\text{touchdown}}
-\]
-
-越容易控制、越容易做 RL reward，但与真实声音之间隔了很多物理过程。
-
-越靠后，比如：
-
-\[
-SPL_{\text{mic}}
-\]
-
-越接近最终目标，但也越容易受到：
-
-- 地板材质；
-- 房间混响；
-- 麦克风位置；
-- 电机声；
-- 风扇声；
-- 人说话；
-- 其他机器；
-- 背景噪声
-
-污染。
-
-QuietWalk 实际上是在寻找中间的平衡点：
-
-\[
-\boxed{\text{GRF}}
-\]
-
-既比 foot velocity 更接近**冲击声的物理原因**，又不像麦克风那样被房间声学严重耦合。citeturn22view0turn22view1
-
-但是，从你的研究视角，我认为这里反而暴露出了一个很明显的空白：
-
-> **现有 quiet locomotion 文献大多在 “foot kinematics → contact dynamics” 这一级做 proxy，但“contact dynamics → structural vibration → acoustic radiation”这一段还没有被充分利用。**
-
-例如完全可以研究：
-
-\[
-\boxed{
-P=
 [
-v_{\text{touchdown}},
-\hat F_z,
-a_{\text{foot}},
-a_{\text{body}},
-PSD_{\text{vib}},
-\tau/I
+Future\ Consequence
 ]
+
+系统变成：
+
+[
+Environment
+\rightarrow
+\text{Generate Future Motions}
+\rightarrow
+\text{Predict Consequences}
+\rightarrow
+\text{Select Motion}
+\rightarrow
+\text{Execute}
+\rightarrow
+\text{Observe Real Consequence}
+\rightarrow
+\text{Correct}
+]
+
+所以技术本质不是：
+
+> “给 QuietWalk 多加一个网络。”
+
+而是：
+
+> **把静音所对应的 GRF、冲击和噪声，从训练阶段用于评价动作好坏的反馈信号，进一步提升为机器人在线选择未来运动方案的决策依据；同时利用真实执行后的物理后果形成快、慢两个闭环。**
+
+---
+
+# 10. 如果以专利的“技术问题—技术手段—技术效果”来理解
+
+**技术问题**是：仅靠通用静音 locomotion policy，很难在地板材质、鞋底、负载等变化后，既提前选择合适的静音步态，又补偿真实接触动力学与模型预测之间的偏差。
+
+**技术手段**是：先生成多种满足行走目标的未来 whole-body motion，预测各运动对应的 GRF/impact/noise 等未来物理后果，据此选择 quiet motion；执行过程中继续检测真实后果，通过快速执行修正和较慢的 motion replanning 两级闭环持续调整。
+
+**技术效果**不是单纯“GRF 更低”，而是：
+
+> **机器人获得了“动作发生前规避高噪声运动 + 动作发生时补偿真实环境偏差”的能力，因此面对不同地面、鞋底、负载和机器人状态变化时，仍有机会保持较好的静音效果。**
+
+因此，这张图真正想让专利人员看到的核心不是九个算法模块，而是一个非常简单的变化：
+
+[
+\boxed{
+\text{踩响了再学}
+\quad\longrightarrow\quad
+\text{踩之前先判断，踩的时候再修正}
 }
-\]
+]
 
-再通过真实声音学习：
-
-\[
-\hat L_A
-=
-f(P,\text{floor})
-\]
-
-其中：
-
-\[
-\hat L_A
-\]
-
-不一定作为低层 RL 每一步直接 reward，而可以成为一个**可微/可在线估计的 acoustic proxy model**。
-
-这与当前“只用 GRF”的思路有明显差别：**GRF 解释“脚撞得重不重”，IMU/结构振动则开始解释“这次撞击究竟有多少机械能真的进入了机器人—地板系统并形成了可辐射振动”。** 从现有 2025–2026 静音 locomotion 论文的 proxy 分布来看，这一层目前明显没有 touchdown velocity 和 GRF 那么拥挤。citeturn21view0turn22view0turn22view3
-
-最终可以把当前文献格局压缩为一句话：
-
-> **近五年静音机器人行走中，最核心的 noise proxy 不是麦克风，而是“落脚冲击”的物理代理：2025 年以 foot contact/touchdown velocity 为主，随后扩展到 impact velocity + contact force，2026 年进一步出现 predicted vertical GRF、\(\Delta v_z\) 和 compliant contact model；IMU 振动谱、结构加速度、关节电流以及高级音频特征目前还没有成为这一方向的主流控制 proxy。** citeturn19search0turn23search0turn21view0turn17search0turn20view3
+这就是这套方案最适合作为“场景外衣”的解释方式。
