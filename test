@@ -1,37 +1,89 @@
-1. 发明背景介绍
-a.	发明的技术领域
-本发明属于人工智能技术领域，具体涉及一种高保真的人脸图像恢复方法。
 
-b.	现有技术的说明
-智能手机的成像功能越来越强大，尽管如此，受硬件物理尺寸的限制，在一些场景下，如高倍变焦拍照、光照不足、者物体运动等，拍照质量急剧退化，不能满足用户对照片质量要求越来越高的需求。
- 
-图1 用户对图像质量的个性化需求
-手机竞争社在改善手机图像质量方面付出了巨大努力，特别是基于AI算法的画质增强算法，几乎成为每一次迭代的旗舰机的重要特征和亮点。例如： 
-苹果iPhone14 Pro：一款可以捕捉你最狂野想象的相机；
-华为Mate60 Pro：超级快速快照，捕捉瞬间的美好时刻；
-小米14 Pro：光线吸收率提高36%*，即使在黑暗环境中也能拍摄出绚丽的照片；
-Find X7 Ultra：拥有出色的光线捕获能力，甚至在夜晚也能清晰、生动地描绘人像，等。
-然而，在一些造成图像质量严重退化的场景下，手机图像质量仍然有巨大的改善空间。
 
-c.	现有技术问题或要改善的地方
-“人脸恢复” （face restoration）技术是图像质量增强技术的重要分支，也叫“人脸重绘”（face redrawing）或“人脸幻构”（face hallucination）是专门针对人脸部区域的图像质量进行改善的一种技术，这种改善包括但不限于细节的恢复与生成（纹理模糊的地方插值出更精细的纹理，没有纹理的地方要生成语义合理、真实自然的纹理），降低图像噪声，消除模糊以使用图像清晰等等。需要强调的是，人脸重绘技术与许多智能手机中的“美颜”功能有重要区别：一是目的不同，美颜的目的是使人脸更“好看”，主观因素较多；而人脸重绘是恢复出真实自然的人脸细节，客观因素主导。二是手段不同，美颜通过改变人脸的特征来改善视觉效果，例如通过改变人脸的形状获得“大眼”或“瘦脸”效果；人脸重绘则通过在现存的纹理先验信息中插值生成高频的细节信息，也包括通过学习海量的高清人脸先验知识，在无纹理区域生成语义合理且真实自然的纹理细节。三是它们在相机管道中的位置不同。在相机流水线管道中，人脸重绘位于靠前的位置，而美颜则位于更靠后的位置。一般情况下，人脸重绘可以作为美颜的基础或输入。
-d.	现有问题的解决方案以及本发明的目的
-1、现有商用技术方案和问题
-目前，以有的商用解决方案大致包括两大类别，一是基于对抗生成网络的解决方案。三星、苹果、小米和OPPO等智能手机制造商都采用了基于对抗生成网络的图像恢复解决方案。然而，由于生成器（基于CNN或基于Transformer）的模型容量有限，他们在某些极端场景中仍然无法产生令人满意的结果。另一种方案是基于AI的云解决方案（可以华为Mate 60 Pro上检测到这种方案），该方案使用不同曝光时间的多帧作为输入，目的是利用帧之间的补充信息。这种方法在许多场景中，比如夜景，实现了良好的恢复效果。然而，在其他场景，比如长距离变焦（10X - 100X），这种解决方案仍然失败。原因是传感器由于距离较远而捕捉到的信息非常少，提高曝光时间没有带来显著的益处。
-2、现有学术技术方案和问题（最接近的现有技术）
-论文DiffBIR（DiffBIR：Towards Blind Image Restoration with Generative Diffusion Prior, CVPR2023）是低质量人脸图像恢复的SOTA技术，其技术框架图2如下所示。
- 
-图2 DiffBIR整体结构
-在推理阶段，它包括两个阶段：
-第1阶段旨在从低质量（LQ）图像中去除大部分退化（尤其是噪声和压缩伪影），以便从未知和复杂退化的LQ图像中恢复尽可能干净的图像。
-第2阶段使用扩散生成模型来再现丢失的信息，而不受噪音破坏的干扰。这种设计鼓励隐式扩散模型更加注重生成纹理和细节，从而得到更加逼真和更加清晰的结果，而不会出现错误的细节。
-一般来说，对于严重退化的肖像恢复，人类视觉评估涉及两个基本方面：1）是否是同一个人，即恢复的保真度如何，以及2）纹理恢复是否自然且没有伪影。然而，在这两个方面，商业解决方案和最先进的解决方案都存在问题。如下图所示。
- 
-图3 学术方案存在的问题示意图
-现有学术方案的技术问题：
-问题1：保真度差
-原因：由于硬件物理限制，在某些情况下（如高倍率变焦），传感器可以捕捉到相对较少的有效图像信息，缺乏可识别的纹理结构信息。即使如此，在DiffBIR的第一阶段，消除退化的过程可能会进一步消除一些有益的结构和纹理信息，导致有效ID特征进一步减少，从而降低恢复后人脸图像的保真度。例如，在右边的例子中，输入人像戴眼镜，但恢复后的肖像没有。低质量输入中的眼镜被视为退化并移除，导致有效ID特征进一步减少。
-问题2：特性伪影
-特性伪影指的是神经网络产生的不真实、不合理和不自然的纹理，例如脸上的头发。
-原因：（1）同样，如果DiffBIR的第一阶段退化消除不理想，一些不适当的纹理可能会残留。这些不适当的纹理可能会在纹理生成阶段引入意外的伪影。（2）由于第二阶段基于扩散模型，它继承了由于随机性引起的偶尔不必要的伪影和幻觉的局限性。
-本发明公开了一种高保真地恢复极端退化条件下的低质量人脸图像方案。极端退化主要指人像中的有效信息严重丢失，例如使用高倍率变焦拍摄的人像，其中因硬件限制、物体运动或光照不足等因素造成的信息损失。扩散技术作为一种通用技术，广泛应用于各种视觉任务。然而，当使用扩散技术来改善极度退化的人脸图像时，出现了两个主要问题：1）恢复后的图像缺乏保真度；2）可能产生伪影。本发明旨在解决这两个主要问题。为了解决保真度不足的问题，本发明利用了一个高质量的参考人脸图像并引入了两个组件：高效ID提取器和纹理保真度保存器。它们分别专门设计用于确保身份和纹理方面的保真度。此外，还设计了一个自适应负参考构建器来引导扩散过程以避免生成伪影。
+## Part 1: Background (Slide 2–3)
+
+### Slide 2 — Technical Field & User Demand
+- Positioning: Technical Field = Robot Loco-Manipulation, Humanoid Robot, Dexterous Grasping, Vision-Language-Action Model; Application = Logistics Grasping, Housekeeping; Product = Humanoid Robot, Autonomous Mobile Robot, Service Robot; Project = [ARF] Natural Presence Humanoid for Harmonious Living Spaces.
+- User demand: quieter humanoid locomotion for shared living spaces. Humanoid robots are moving from industrial environments into shared living spaces; home robots are expected to operate around people for long periods of time; in bedrooms, living rooms and other quiet indoor spaces, repeated footstep impacts and vibrations can noticeably affect sleep, conversation, and daily life. For an always-present home robot, not disturbing people becomes part of the basic user experience — simply completing a task is no longer enough.
+- Scene images: robot serves as a waiter; robot helps human with breakfast; robot cooks together with humans.
+
+### Slide 3 — Competitor Status
+- Sony: aibo Ver. 5.00 changed its walking behavior specifically to reduce the "click-clack" noise of its feet (through software and control strategies);
+- 1X: NEO is designed specifically for domestic environments — tendon-drive actuation, compliant motion and a soft body; 1X officially specifies a noise level of only 22 dB, explicitly comparing it with a modern refrigerator; low-noise operation is treated as a consumer-facing product attribute;
+
+- Conclusion: industry products already validate the value of quiet locomotion (quietness is gradually moving from a research topic to a product capability), while maintaining quietness under changing execution conditions remains an open problem — when the robot state, payload, or ground condition changes, quiet performance may not remain stable.
+
+
+## Part 2: Problems (Slide 4–7)
+
+### Slide 4 — Two Paradigms of Humanoid Locomotion Control
+- Paradigm 1: Locomotion Policy Learning. Representative: QuietWalk[1] — directly trains a locomotion policy for low-impact walking; during training, GRF-based impact penalties encourage the policy to reduce foot-ground impact while maintaining stable locomotion. Limitation: its quiet behavior is mainly learned from the training distribution and fixed inside the trained policy; when robot condition/foot-ground interaction changes during execution, the policy doesn't explicitly adjust each planned support transition according to current condition. For example, in home humanoid scenarios, even similar current states may lead to very different next-foot timing, support foot, landing point, and CoM/support-transfer demand under actions such as emergency turning, sidestepping around obstacles, stepping over obstacles, and loco-manipulation.
+- Paradigm 2: Motion-Conditioned Tracking. A Future Motion first describes how the robot should move, and a Tracking Policy then executes this motion on the physical robot. More suitable for quiet walking: we can first generate a quiet-oriented Future Motion, and then separately handle the execution errors that appear on the real robot.
+- References: [1] QuietWalk: Physics-Informed Reinforcement Learning for Ground Reaction Force-Aware Humanoid Locomotion Under Diverse Footwear, arXiv:2604.23702; [2] Learning Quiet Walking for a Small Home Robot, 2025 ICRA (Sony); [3] SONIC: Supersizing Motion Tracking for Natural Humanoid Whole-Body Control, arXiv:2511.07820 (NVIDIA).
+
+### Slide 5 — Baseline: SONIC, Its Usefulness and Limitation
+- SONIC follows Paradigm 2; the invention focuses on the motion-tracking stage and uses a SONIC-based tracker as the baseline execution framework.
+- Why this paradigm is useful for quiet walking: the motion-generation stage can be specifically trained (with quiet-motion data, rewards, or trajectory constraints) to generate a quiet-oriented future motion — e.g., lower touchdown velocity, smoother swing-leg deceleration, and a more gradual support transition. The generator plans how the robot should move quietly, and the tracker is responsible for realizing this motion on the physical robot.
+- SONIC process: an upper-level module generates a Future Motion from a task instruction, target motion, or human motion reference → encodes it into a Motion Token → combines it with the current robot state → a Tracking Policy generates real-time whole-body joint actions. SONIC separates two problems: Motion Generation decides how the robot should move, while Motion Tracking is responsible for executing that motion on the physical robot.
+- However: SONIC is mainly designed for general motion tracking; it does not specifically guarantee that the planned quiet motion can still be realized quietly when robot payload, actuator response, or foot-ground interaction changes. Therefore the invention keeps the basic tracking capability of SONIC while adding a dedicated quiet correction branch, which uses the Future Motion and actual execution state to adjust the support transition and joint actions, so that the planned Quiet Future Motion can be physically realized as quiet walking.
+
+### Slide 6 — Problem Description: Planned Quiet ≠ Executed Quiet
+- As the execution condition changes, the same quiet-oriented future motion can result in a heavier and louder touchdown ("Same quiet future motion, different realized support transition").
+- Example (actuator delay): the robot is slowly lowering its foot for a quiet landing. With actuator delay, the real foot motion falls behind the reference, but the body may already start transferring weight toward the new support foot. The foot can no longer continue the slow touchdown and needs to establish support quickly to prevent imbalance, resulting in a heavier and louder landing.
+- Key statements: "A motion that appears quiet in the planned trajectory does not always result in quiet physical execution." And: "Even when the future motion is generated for quiet walking, the actual touchdown can still become heavier and louder than intended when robot state or contact condition changes during real execution."
+- Speaker notes emphasize: the problem is NOT that the Future Motion is not quiet enough, and motion tracking itself does not clearly fail (both sides use the same Quiet Future Motion, and the overall robot posture is very similar). The main difference appears during touchdown and load transfer: on one side the new support foot touches the ground softly and gradually takes over the body weight so the contact force rises smoothly; on the other side the new support foot takes the body weight too quickly, creating a clear impact peak and a louder footstep. "The planned motion is still quiet-oriented, but the intended quiet support-transfer process is not always preserved during real physical execution."
+
+### Slide 7 — Conclusion: the Chain & Two Gaps
+- Conclusion (verbatim): "Quiet execution therefore requires bridging both: Quiet Future Motion → Desired Quiet Support Transfer → Actual Quiet Execution." — i.e., quiet execution requires bridging BOTH gaps along the chain (the two arrows between the three waypoints): discrepancies between planned quiet motion and the actual execution conditions are the primary drivers of quiet-execution failure, mainly coming from two gaps.
+- Gap ① Kinematics-to-Dynamics Gap: the future motion mainly specifies how the robot should move, such as joint poses, body motion, and foot trajectory (it is usually learned from human reference motions, which do not satisfy the robot's dynamics). However, quiet touchdown also depends on how the robot physically transfers its body weight, establishes foot contact, and builds up the contact force — when the CoM moves, when the swing leg is unloaded, when the foot touches the ground, and how quickly the new foot starts to carry the body weight. Example: if the swing leg is not properly unloaded before lift-off, the robot cannot simply follow the planned foot trajectory without affecting balance or quiet support transfer. (The slide-7 figure annotation binds this to Stage A: "if the CoM is not properly unloaded from the swing leg, no matter how much torque the motor outputs, it cannot lift the foot according to the future reference motion.")
+- Gap ② Execution-Condition Gap: even with the desired quiet support-transfer process, changes in actuator response, payload, robot state, or foot-ground interaction can make the real execution different from the planned motion. Example: with a heavier payload, the body may transfer weight to the new support foot too quickly; the foot then carries a large load immediately after contact, causing a larger impact and a louder footfall. (Figure annotation binds this to Stage B: "under a heavier payload, the CoM may transfer toward the landing foot too quickly.")
+- Why the gap happens — five deviation sources: kinematic deviation; dynamic-response deviation (velocity, acceleration, or momentum transfer differs from nominal execution); contact-timing deviation (actual touchdown or support-transition timing shifts); robot/payload dynamics (inferred from execution history, e.g., mass distribution, delay, or body-state changes); ground/contact dynamics (inferred from contact response, e.g., terrain, friction, or compliance changes).
+- The figure divides the CoM support-transfer process into 3 phases and contrasts planned vs. actual:
+  - Stage A (Swing Unloading & CoM Preparation): planned = gradual unloading, CoM moves smoothly; failure = unloading is slower/inconsistent, CoM does not move forward enough;
+  - Stage B (Swing Deceleration & Contact Isolation): planned = foot gently establishes contact, load remains mainly on the old support leg; failure = foot touches down earlier/harder, new support leg begins taking load too early;
+  - Stage C (Smooth Load Acceptance): planned = gradual load transfer, smooth load acceptance; failure = load transfer is abrupt, impact becomes larger → loud contact.
+
+## Part 3: Our Insights (Slide 8–9)
+
+### Slide 8 — Two Core Insights
+- Insight 1: quiet touchdown needs to be prepared in advance. The CoM and support state set before landing largely determine how the foot touches down and takes the load. Once the foot is about to land, correcting only the foot action is often too late.
+- Insight 2: quiet support transfer should be adjusted phase by phase. Different joints matter at different phases, and the needed adjustment also changes with the robot dynamics (slow dynamic) and contact conditions (fast dynamic). Three stages: Stage A: Unload & CoM Preparation → Stage B: Light-Contact Isolation → Stage C: Smooth Load Acceptance.
+- Speaker-notes slogan: "Prepare the quiet support transfer in advance, then adapt its execution phase by phase."
+
+### Slide 9 — Insights Expanded & Framework Embryo
+- Insight 2.1 (phase × joint responsibility): a quiet landing is not a uniform control process; its physical objective changes naturally across the three stages — before contact, the controller needs to prepare the CoM and momentum while unloading the future landing foot; around touchdown, it must suppress impact and avoid premature load transfer; after contact, it must progressively transfer body weight to the new support. Because the stance leg, swing leg, new support leg, and pelvis contribute differently at each stage, phase-aware joint weighting is needed to dynamically assign correction responsibility to the most relevant joints, rather than applying the same quiet residual uniformly to the whole body.
+- Insight 2.2 (phase × time scale): dynamics affecting quiet landing separate into slowly varying robot-side dynamics (slow dynamic: actuator response, payload, motor degradation, body inertia, and long-term asymmetry) and rapidly varying contact-side dynamics (fast dynamic: ground stiffness, friction, contact timing, and slip). During early CoM preparation, the required correction is typically more dependent on slow dynamics, whereas near touchdown and during initial load acceptance, sensitivity to fast dynamics increases significantly. Therefore the controller should estimate the phase-dependent relevance of fast and slow dynamics and inject the resulting dynamics context into the corresponding quiet decoder.
+- Framework embryo: "Phase-aware quiet tracking framework with CoM Correction" — the framework first corrects the centroidal/support-transfer process, then dynamically assigns joint responsibility and adapts the correction to the robot (slow) and contact (fast) dynamics. (The figure shows: Future Motion / Robot State → base tracking, with a quiet-correction path: 1. Quiet CoM Prior Correction → 2.1 Phase-Aware Dynamic Joint-Responsibility Decoding → 2.2 Fast-Slow Dynamics Adaptation → Quiet Correction Action; the base-tracker-plus-branch structure is stated explicitly on Slides 5/10.)
+
+## Part 4: Solutions (Slide 10–13)
+
+### Slide 10 — Overview: Future-Conditioned QuietWalk
+Six-step process: ① generate a quiet-oriented Future Motion from a task instruction, target motion, or motion reference; ② use the Universal Tracking Policy to generate the base action from the Future Motion and current robot state; ③ estimate the CoM transfer trajectory required for quiet execution, compare it with the base CoM trend, and generate the quiet correction token and current support-transition phase; ④ redistribute joint responsibility according to the current support-transition phase, and route slow and fast dynamics for the current phase; ⑤ generate the phase- and dynamics-conditioned quiet joint correction; ⑥ combine the quiet correction with the base action to obtain the final robot action.
+The three Innovations as three questions:
+- Innovation 1 (Phase-Aware Quiet CoM Prior Correction) — What needs to be corrected? Estimate how the CoM should transfer for quiet execution and compare it with the base CoM trend to identify what needs to be corrected, generating the quiet correction token and current support-transition phases;
+- Innovation 2 (Phase-Gated Dynamic Joint-Responsibility Decoding) — Which joints should perform the correction? Dynamically determine the joint responsibility for quiet correction according to the current support-transition phase, so that unloading, soft touchdown, and load acceptance are mainly controlled by the joints that are most important at each stage (notes: during unloading and CoM preparation, the hip, knee, pelvis, and torso may play a larger role; near touchdown and load acceptance, the ankle and lower-limb joints become more important — instead of a fixed joint allocation);
+- Innovation 3 (Phase-Aware Fast–Slow Dynamics Routing) — How should the correction be executed under current physical conditions? Adapt quiet-action decoding according to the current phase by jointly considering slowly varying robot conditions and short-term foot-ground interaction responses, enabling robust quiet execution under different payloads, robot states, and ground conditions.
+- Key idea: not to plan a completely new gait. Instead, the quiet correction branch corrects the base action when the real execution starts to deviate from the planned quiet behavior, making sure the original quiet-oriented Future Motion can still be realized as low-impact and stable quiet walking under real and changing execution conditions.
+
+### Slide 11 — Innovation 1: Phase-Aware Quiet CoM Prior Correction
+Introduces a recurrent, future-aware CoM correction mechanism on top of the base tracker: it jointly reasons over future motion and actual execution history to estimate the quiet CoM state required at the current step, then converts its deviation from the base CoM state into a compact correction token for quiet support-transfer control.
+- ① Recurrent Support-Transfer Reasoner: sliding-window Future Motion Tokenization + History Encoder + Future–Execution Cross-Attention (selectively focuses on the future motions most relevant to the robot's current state) + GRU State Update (h_t, maintaining the progress of the same support-transfer event across consecutive control steps) → predicts the current quiet support-transfer state, phase (Phase Head; g_t = [g_t^A, g_t^B, g_t^C] as given on S12/S13), and landing-event context;
+- ② Quiet CoM-Correction Token Generator: Base CoM Prior Projector (z_base) and Quiet CoM Prior Projector (z_quiet) → Difference Learner Encoder (inputs: z_base, z_quiet, z_base−z_quiet, z_base⨀z_quiet) → Context-Aware Gate (conditioned on h_t and g_t, selecting the correction components actually relevant at the current control step) → Bottleneck Projection → Quiet CoM-Correction Token z_corr for downstream quiet residual decoding;
+- Training-only supervision (PDF p11 figure): Base Physical Rollout G_base and Quiet Physical Rollout G_quiet in simulation → Shared Privileged CoM Encoder → the resulting features supervise (L_base / L_quiet) the two online prior projectors, respectively.
+
+### Slide 12 — Innovation 2: Phase-Gated Dynamic Joint-Responsibility Decoding
+- ① Phase-Conditioned Joint Responsibility Router: inputs = quiet correction token z_corr, phase weights g_t = [g_t^A, g_t^B, g_t^C], base motion token z_motion, robot state O_t, and dynamics contexts from Innovation 3 → after fusion, the Phase Query Encoder converts the current support-transfer phase and CoM correction info into a phase query, while the Joint/Role Encoder represents the current state and functional role of each joint → Phase-Conditioned Attention estimates which joints should primarily contribute to the current correction, providing a structured responsibility map w_t^A, w_t^B, w_t^C for residual control;
+- ② Phase-Specialized Quiet Residual Experts: a shared quiet residual feature encoder fuses motion context, z_corr, and robot state into a common feature f_t; for each phase k, the corresponding dynamics context z_dyn^k modulates f_t through a (per-phase) FiLM layer, and the phase-specialized decoder head predicts residual actions Δa_t^k — the three experts learn distinct correction strategies for CoM preparation, contact isolation, and load acceptance, each specializing in the distinct physical objective of its support-transfer phase; joint-responsibility weights constrain each residual to the joints most relevant to the current stage. Benefits: this structured routing reduces cross-phase interference and improves credit assignment during RL training;
+- Combination formula: Δa_quiet = g_t^A·(w_t^A ∗ Δa_t^A) + g_t^B·(w_t^B ∗ Δa_t^B) + g_t^C·(w_t^C ∗ Δa_t^C) (the source formula uses ∗ for elementwise multiplication; ⊙ appears in the figure as the multiplication-node symbol), softly combined using the phase weights, then added to the base action to obtain the final robot action.
+
+### Slide 13 — Innovation 3: Phase-Aware Fast–Slow Dynamics Routing
+- ① Slow Dynamics Encoder: input = long execution history; estimates slowly varying robot response caused by payload, actuator delay, stiffness, damping, etc.; output = z_slow;
+- ② Fast Dynamics Encoder: input = short execution history; estimates current foot-ground response such as touchdown timing, contact hardness, friction, force rise, and slipping; output = z_fast;
+- ③ Phase-Aware Fast–Slow Routing: input = z_fast, z_slow, phase embedding. The Relevance Estimator module determines the relative importance of fast and slow dynamics information for quiet control at the current support-transfer phase and assigns phase-dependent relevance weights (β_slow, β_fast); the Adaptive Fusion module adaptively fuses them into a unified dynamics context z_dyn^k for the quiet residual controller (used as the FiLM condition of the corresponding phase expert);
+- The short- and long-term histories are extracted from the same proprioceptive observation stream, but over different temporal ranges: the short-term history densely samples recent observations to capture rapid contact changes, while the long-term history spans a wider window to capture persistent robot dynamics;
+- Training: in simulation, dynamics randomization is grouped by timescale — slow dynamics such as actuator response, body mass, and payload are varied across rollouts, while fast dynamics such as friction, compliance, and contact conditions are varied across contacts or steps; the two encoders are trained with their corresponding privileged dynamics groups to learn z_slow and z_fast;
+- Phase-relevance examples: Phase A (CoM Preparation) — persistent changes such as increased payload or slower actuator response directly affect how early and how quickly CoM should be transferred, making z_slow more relevant; Phase B (Contact Isolation) — rapid changes such as harder ground, earlier-than-expected touchdown, or slip tendency directly influence foot braking and touchdown impact, increasing the relevance of z_fast; Phase C (Load Acceptance) — smooth load transfer depends on both body/payload dynamics and ground/contact response, so both fast and slow dynamics may be important.
+
+## Narrative Arc (one sentence)
+
+Home scenarios demand quiet walking (S2) → industry has validated its value, but keeping quietness stable under changing execution conditions remains open (S3) → of the two paradigms, motion-conditioned tracking fits better, yet SONIC does not guarantee quiet execution (S4–5) → the problem: the same quiet future motion can realize a different, louder support transition (S6) → quiet execution requires bridging both gaps along "Quiet Future Motion → Desired Quiet Support Transfer → Actual Quiet Execution": the Kinematics-to-Dynamics Gap and the Execution-Condition Gap (S7) → insights: quiet touchdown must be prepared in advance, and support transfer should be adapted phase by phase across three stages (S8–9) → solution: add a quiet correction branch on top of the base tracker, with three Innovations answering "what should be corrected / which joints should make the correction / how should the correction be adapted to the current physical condition" (S10–13).
