@@ -1,145 +1,158 @@
-# REPORT.md — TM 算子库实验回传报告
+我已读取 GitHub `main` 分支中的 [EXP1.md 实验报告](https://github.com/baolinv0/HarnessIR/blob/main/docs/experiments/vlm_stage_calibration_20261024/EXP1.md?utm_source=chatgpt.com)，并核对了同目录的实验计划、模板和执行记录。
 
-**日期**：2026-10-24 ｜ **范围**：10 个最终主臂配置 × 2 数据集 × 4 评测协议 ｜ **状态**：全部完成（72+ 任务实验矩阵收口）
+## 一、总体评价
 
----
+E1 有条件通过
 
-## 1. 概述
+这轮实验取得了实质性进展：P1 策略已从手工 Prompt Probe 进入真实的 Qwen-HarnessIR Compose 阶段，并在五张样本中取得了正向结果。
 
-本回传包覆盖 TM 算子库在 AppleGT 上的完整实验：自由 LTM baseline、5 个参数化 TM 算子（region_curves / exposure_fusion / base_detail / gain_residual / spatial_grid，含 v1→v2/v3/affine/g128 改进链）、第 7 模型 SCB（独立语义网络，15.6M 参数）、以及 2 个"baseline+校正层"配置（corr_gr / corr_rc）。
+我的判断是：
 
-**交付物地图**（本目录）：
+- 工程验证：通过。 实际生成 20/20 成功，10 组 seed 配对完整，已有结果支持保留 P1。
+- 改善证据：中等强度。 执行者目检报告 2 张明显改善、3 张持平或略胜，没有观察到严重内容错误。
+- 因果机制：部分支持。 P1 的有效性得到支持，但还不能证明改善全部来自“重建许可”，因为同时调整了恢复目标和指令组织。
+- 泛化能力：尚未验证。 只有 5 张开发图，而且评价未盲化。
 
-| 文件 | 内容 |
-|---|---|
-| `run_registry.csv` | 10 run × 4 协议 = 40 条评估登记（含 ckpt SHA256） |
-| `dataset_manifest.csv` | applegt val 855 + newbinary test 21 = 876 样本（含输入/GT SHA256） |
-| `per_image_metrics.csv` | ~17.5k 行逐图指标（4 协议全覆盖，无静默删图） |
-| `training_history.csv` | 10 run × 50 epoch × train/val = 1000 行 |
-| `runtime_samples.csv` | AppleGT 855×9 逐图延迟（scb 见 missing_items） |
-| `case_index.csv` | newbinary 全部 21 样本 × 10 方法 = 210 案例行 |
-| `missing_items.csv` | 9 条缺失/限制声明（种子复现、区域指标等） |
-| `protocols/*.json` | 4 套评测协议完整定义 |
-| `configs/` | 10 份生效配置 + COMMANDS.md + ENV.txt |
-| `logs/` | 10 份训练日志 + 评估 JSON 原件 |
+决策：同意 P1 进入下一轮验证，但暂不替换默认生产策略。 这是比“需要继续尝试是否有能力”更进一步的结论。
 
-**大文件外链**（模板允许）：checkpoint 与渲染图不打包，登记绝对路径 + SHA256；核心数据根：`/home/xx.xing/code/data/AppleGT/tm_g2606/runs/`（78 任务目录）与 `<repo>/results/`（newbinary 渲染与报告）。
+## 二、逐图结果审查
 
-## 2. 协议与 ID 体系
+| 图像            | P1 相对 P0                | 我的判断       | 需要关注的问题         |
+| ------------- | ----------------------- | ---------- | --------------- |
+| `0043` 严重运动模糊 | 两个 seed 均恢复车轮、车体结构，亮度上升 | 最有说服力的成功案例 | 重建是否忠实，还是看起来合理  |
+| `0042` 夜间道路   | 暗部提亮，seed42 改善更明显       | 正向         | 恢复信息是否增加，而非单纯调亮 |
+| `0024` 低光猫    | 两个 seed 均略亮，纹理相当        | 小幅改善       | 猫毛细节与暗部噪声       |
+| `0028` 夜景     | 亮度上升，尾灯控制相当             | 小幅改善       | 天空提升是否必要、文字是否保持 |
+| `0049` 霓虹招牌   | 亮度下降，光晕可能更小，文字未解决       | 未见明确收益     | 需要文字与局部光晕实验     |
 
-- **eval_id** = `<method>__<protocol_id>`，如 `corr_gr__applegt_val_gamma2606`
-- **protocols**：
-  1. `applegt_val_gamma2606` — AppleGT val 855 张，gamma2606 编码空间（训练协议原始指标，全指标集）
-  2. `applegt_val_origGT_srgb` — 同集，2606 解码 → 原始 `GT/val` 8-bit sRGB（公共显示空间公平比较）
-  3. `newbinary_redraw_aligned` — newbinary test 21 张 4000×3000，vs redraw GT（**像素对齐**，排名依据）
-  4. `newbinary_iphone_nonaligned` — 同输入，vs iPhone GT（**非对齐**同场景，仅色调风格参照，不作排名）
-- **训练协议**（全部 run 统一）：AdamW(1e-4, wd 1e-4)，StepLR ×0.95/ep，clip 1.0，50 epoch，seed 7，256² 裁剪，CompositeLoss(rgb 1.0 + log_luma 0.1 + gradient 0.1)；checkpoint 选择 = val_loss min。
-- **方法清单**：baseline / corr_gr / corr_rc / gr_v2 / sg_v2 / bd_v2_affine / ef_v2 / ef_v3 / rc_g128 / scb。
+### 最重要的结果是 `0043`
 
----
+Seed 0 · 全图 sharpness
 
-## 3. 主结果（聚合自 per_image_metrics.csv）
+## 261.6 → 244.6
 
-### 3.1 协议 applegt_val_gamma2606（同分布，训练协议口径）
+指标略下降，但报告目检 P1 车体结构更清楚
 
-| method | PSNR | SSIM | ΔE76 | 延迟 ms（tm_only 均值） | 参数量 |
-|---|---|---|---|---|---|
-| **corr_gr** | **23.78** | **0.9278** | **7.03** | 496 | 211K |
-| baseline | 23.68 | 0.9272 | 7.25 | 487 | 207K |
-| corr_rc | 23.52 | 0.9250 | 7.66 | 520 | 211K |
-| gr_v2 | 20.95 | 0.8862 | 9.91 | 39 | 211K |
-| sg_v2 | 20.94 | 0.8888 | 10.41 | 48 | 222K |
-| bd_v2_affine | 19.87 | 0.8390 | 11.97 | 132 | 211K |
-| ef_v3 | 18.33 | 0.8221 | 14.53 | 253 | 211K |
-| scb | 18.27 | 0.8217 | 12.91 | 10* | 15.6M |
-| ef_v2 | 15.98 | 0.7666 | 18.59 | 199 | 211K |
-| rc_g128 | 14.46 | 0.7094 | 21.77 | 33 | 211K |
+Seed 42 · 全图 sharpness
 
-*scb 延迟为聚合均值（无逐图记录，见 missing_items）；其逐图 gamma2606 指标为离线重算（raw_metrics_path 标注）。
+## 222.4 → 256.4
 
-### 3.2 协议 applegt_val_origGT_srgb（同分布，公共 sRGB 空间）
+指标上升，报告目检同样改善
 
-| method | PSNR | SSIM | ΔE76 |
-|---|---|---|---|
-| **corr_gr** | **25.03** | **0.9442** | **6.41** |
-| baseline | 24.89 | 0.9440 | 6.67 |
-| corr_rc | 24.59 | 0.9405 | 7.15 |
-| sg_v2 | 22.20 | 0.9166 | 9.41 |
-| gr_v2 | 22.01 | 0.9109 | 8.96 |
-| bd_v2_affine | 20.80 | 0.8665 | 11.42 |
-| ef_v3 | 19.39 | 0.8519 | 13.23 |
-| scb | 19.10 | 0.8506 | 12.44 |
-| ef_v2 | 17.38 | 0.8132 | 16.06 |
-| rc_g128 | 15.94 | 0.7675 | 18.63 |
+这说明你已经不能简单用全图 Laplacian 方差衡量车体去模糊质量。
 
-两口径排名一致；sRGB 空间绝对值系统性偏高（空间特性，非模型差异）。
+但也要区分两个层次：
 
-### 3.3 协议 newbinary_redraw_aligned（分布外，排名依据）
+可以支持： P1 能帮助 Qwen 生成结构更清晰、外观更合理的恢复候选。
 
-| method | PSNR | SSIM | ΔE76 | 12MP 延迟（cuda:1 独占） |
-|---|---|---|---|---|
-| **corr_rc** | **17.39** | **0.850** | **15.94** | 483 ms |
-| gr_v2 | 17.23 | 0.848 | 15.99 | **17 ms** |
-| corr_gr | 16.92 | 0.853 | 16.23 | 486 ms |
-| sg_v2 | 16.66 | 0.850 | 16.48 | 23 ms |
-| baseline | 16.50 | 0.843 | 17.15 | 466 ms |
-| ef_v2 | 16.14 | 0.834 | 17.86 | 48 ms |
-| bd_v2_affine | 15.93 | 0.806 | 18.46 | 23 ms |
-| ef_v3 | 15.09 | 0.810 | 20.22 | 73 ms |
-| rc_g128 | 14.68 | 0.771 | 22.18 | 20 ms |
-| scb | 9.06 | 0.505 | 35.37 | 101 ms |
+还不能支持： P1 恢复了原始真实车辆的全部细节。
 
-- 逐张胜率（vs baseline）：corr_rc **18/21**、gr_v2 14/21、ef_v2 12/21、corr_gr 11/21、sg_v2 11/21、bd_v2_affine 10/21、rc_g128 3/21、scb 3/21。逐张 σ≈4 dB，均值+胜率双口径并列。
-- 协议 newbinary_iphone_nonaligned 全部位于 9.0–10.6 dB 窄带（非对齐参考，区分度低），仅作风格参照，见 protocols JSON。
+没有 GT 的情况下，合理的轮毂形态仍可能包含生成先验。作为产品视觉增强，这可能有价值；作为忠实图像复原，则需要单独披露。
 
+## 三、报告存在的四个问题
 
----
+### 问题 1：视觉证据尚未实现外部复核
 
-## 4. 失败根因（机制解剖）
+报告给出了：
 
-1. **混合坍缩 = 损失最优解（非梯度病理）**：v1 多分支混合结构（region_curves/exposure_fusion）全部坍缩为单分支。机制实验证明 pointwise 假设下全数据集共享单曲线即损失全局最优；v2 抗坍缩开关（sigmoid gate 等）全部零结果，与理论一致。
-2. **三层表达天花板**：自由逐像素 LTM 23.7 > 空间参数化（gr/sg）~21 > 全局参数化（ef/rc）~16。画质差距是表达形式的天花板，不是训练不充分。
-3. **SCB 失败归因**：GTM = 3 条区域全局曲线的 softmax 语义加权混合（仍 pointwise）；LTM 仅 3 通道浅解码；乘法增益形式表达上限低。75× 参数 + 独占语义输入双测试集双输。
+- `roi_compare.jpg`
+- `grid_s0.jpg`、`grid_s42.jpg`
+- `blind_key.json`
+- 原始 PNG 和 `runs.csv`
 
-## 5. 消融链（同分布 gamma2606 口径）
+但是我检查 GitHub 时，`runs/exp1_compose_ab/` 不在 `main` 中，因此没有直接取得这些文件。
 
-| 改动 | Δ PSNR | 判定 |
-|---|---|---|
-| rc_v1→v2（K 共享单调曲线） | +3.07（12.9→16.78） | ✅ 容量/曲线族有效 |
-| ef_v1→v2（EV/曲线可学习） | +6.92（9.06→15.98） | ✅ |
-| bd_v1→v2（结构化分解） | +4.57（15.86→19.24） | ✅ |
-| 抗坍缩开关系列 | ±0.1 | ❌ 零结果 |
-| fixed_table_affine 尾部 | bd_v2 +0.63；baseline +0.00 | ✅ 尾部偏差吸收实锤 |
-| ef_v3（全组合） | +2.35（15.98→18.33）；OOD −1.05 | ⚠️ 同分布↑但迁移↓（自由度→过拟合） |
-| rc_g128（128 knot） | 14.46 | ❌ 全局形式封案 |
-| **corr_gr（校正层）** | **+0.10（首超 baseline）** | 🏆 零强度 ≡ baseline 逐位一致 |
-| corr_rc（曲线校正层） | −0.16 | ≈ 持平，迁移最强（§6） |
+所以目前能核实的是报告文本、实验设计和记录的数值，而不能独立确认图像中是否存在局部生成错误，也不能完成独立盲评。
 
-## 6. 泛化分析（同分布 vs 分布外）
+建议至少提供五张图的统一 ROI 对照，以及匿名候选与盲评对应文件。完整原始数据可以继续留在服务器，通过可访问的归档提供。
 
-| | AppleGT val（同分布） | newbinary（分布外） |
-|---|---|---|
-| 冠军 | corr_gr（23.78 / 25.03） | **corr_rc（17.39，胜率 18/21）** |
-| baseline 名次 | 第 2 | 第 5（迁移跌 7.2 dB） |
-| 参数化算子 | 全败（−2.7~−9.2 dB） | gr_v2/sg_v2/corr 系 ≥ baseline |
+### 问题 2：Compose 阶段的随机性尚未充分控制
 
-**解读**：① 自由 LTM 过拟合 AppleGT 色调风格；② 结构约束 = 正则化 = 泛化（ef_v3 反向佐证：同分布 +2.35 的自由度 → OOD −1.05）；③ SCB 迁移灾难（9.06，渲染图确认系统性欠曝，输出均值 0.165 vs GT 0.492）；④ 延迟 20–28× 差距（LTM 系 ~470–490 ms vs 参数化 17–101 ms，12MP 独占 GPU）。
+报告记录：
 
-## 7. 结论与产品建议
+- Executor seed 为 0 和 42；
+- Compose 使用 27B，temperature=0.6；
+- 每张图、每个策略生成一条 prompt。
 
-1. **校正层路线成立（双证据链）**：同分布 corr_gr 唯一超 baseline 且零强度 ≡ baseline（画质零风险的可控接口）；分布外 corr_rc 第一。
-2. **算子库定位**：baseline 锚点之上的受控调节层（strength/mask/EV 接口），非主力渲染器。
-3. **语义路线（SCB）终止**：根因是表达形式，非语义质量。
-4. **实时场景**：gr_v2（17 ms）/sg_v2（23 ms）替代 LTM 主干，以 ~2.7 dB 同分布差距换 OOD 稳健 + 20× 速度。
+因此，两个 Executor seed 复用了同一条 compose prompt。
 
-**建议产品形态**：`linear in → baseline 锚点 → 校正层（strength=0 ≡ baseline）→ strength/mask/EV 接口 → 固定 gamma 表尾部 → sRGB out`
+这验证了：给定某条 P1 指令时，Qwen 在两个 seed 下是否都能改善。
 
-## 8. 缺失与限制
+但还没有验证：重新调用 27B 生成另一条 P1 指令，是否仍然有效。
 
-见 `missing_items.csv`（9 条）。要点：非 git 仓库（无 commit id，以绝对路径+mtime 标识代码）；主臂评估无语义区域指标（S0）；corr_gr/corr_rc 的 +0.1~0.9 dB 为单种子结果（36 个复跑任务在外部 runs/ 未折叠进本登记）；newbinary 延迟仅模型均值；iPhone GT 协议非对齐仅作风格参照。
+这很重要，因为真正的 HarnessIR 是自动生成指令的系统，而不是固定手写 prompt。
 
-## 9. 产物索引
+建议只选择 `0043` 和 `0049`，对 P0/P1 各重复生成三条独立 Compose 指令，然后固定 Executor seed 比较。这是低成本的稳定性补充，不需要重跑全部 20 张。
 
-- 本目录：REPORT.md + 7 CSV + protocols/ + configs/ + logs/
-- 外部：`<repo>/results/`（newbinary 渲染 10×21 + comparison_grid.png + 复跑脚本 + final_report.md）、`tm_g2606/runs/`（78 任务 ckpt/指标/渲染）、`tm_g2606/applegt_val_origGT.*`、`tm_g2606/mechanism.txt`（机制解剖）、`tm_g2606/final_report.md`（同内容长版）、`arch_diagrams.png`（仓库根，8 面板架构图）
+### 问题 3：恢复目标与重建许可的贡献没有分离
 
+P1 同时增加了：
+
+- 可检查的结构恢复终态；
+- Tier-2 有界重建许可；
+- 针对 Qwen 的区域化保真要求。
+
+因此，本轮正确结论是：
+
+> 新的 P1 Compose 策略有效。
+
+不能进一步断言：
+
+> 改善完全来自放开重建许可。
+
+这是机制归因上的限制，不影响工程上继续采用 P1 作为候选。
+
+如果后续希望形成研究贡献，可以再增加一个消融：保留 P1 的具体恢复目标，但不加入 Tier-2 许可。当前工程阶段无需把它排在 E2/E3 之前。
+
+### 问题 4：文件归档与版本记录需要整理
+
+发现了两项具体问题。
+
+第一，`EXP1.md` 位于：
+
+`docs/experiments/vlm_stage_calibration_20261024/`
+
+但这个目录的 [EXPERIMENT_PLAN.md](https://github.com/baolinv0/HarnessIR/blob/main/docs/experiments/vlm_stage_calibration_20261024/EXPERIMENT_PLAN.md?utm_source=chatgpt.com) 研究的是 27B/32B/8B 的 D/P/J 分阶段模型选择，而 EXP1 研究的是 Qwen Executor 的 Compose 策略。
+
+这是两个不同的实验专题，建议分开归档，避免以后把这次 E1 误认为 VLM 校准计划的 S1 实验。
+
+第二，服务器使用了 8 位 MD5 前缀进行快照记录。建议补齐文件完整 SHA-256、checkpoint revision、完整配置及实际 prompt hash；服务器当前没有 Git 历史不阻止实验，但会降低后续复现和版本比较的可靠性。
+
+另外，报告引用的 `QWEN_HARNESSIR_EXPERIMENT_REPORT_TEMPLATE.md` 目前不在 `main`，此前它提交在 [PR #8](https://github.com/baolinv0/HarnessIR/pull/8?utm_source=chatgpt.com) 中。需要保证后续文档链接指向实际存在的版本。
+
+## 四、下一轮怎么做？
+
+我建议不要重新展开大规模 Executor Capacity Probe。当前已有更明确的问题，需要按顺序解决。
+
+E1 补充验收：独立盲评＋Compose 重复性
+
+对已有 20 张输出进行盲评，不需要重新生成。选择 `0043/0049` 做少量独立 Compose 重复。重点确认 P1 优势是否由自动规划稳定产生，而非单条提示词的偶然效果。
+
+E2：文字恢复
+
+这是当前最大的明显缺口。采用 T0 无转录、T1 自动转录、T2 正确转录，重点检查 `0049` 中 `highball`、`25 hours` 的逐字正确性，避免清晰假字。
+
+E3：Verifier 重放
+
+直接利用已有 redo 候选，不增加 Executor 调用。检查固定暗部 ROI、光晕和结构，判断旧 verifier 是否漏掉了可用的清晰候选。
+
+E4：25 张端到端 A/B
+
+在 E2/E3 验证结束后冻结策略。报告首轮生成质量、最终交付质量、内容错误和实际调用成本；5 张开发图与其余 20 张分别统计。
+
+## 五、最终审查意见
+
+| 维度             | 评价          |
+| -------------- | ----------- |
+| 实验执行完整性        | 通过          |
+| 对照设计合理性        | 基本通过        |
+| P1 相比 P0 的改善证据 | 中等，方向正向     |
+| “重建许可”单独因果解释   | 证据不足        |
+| 内容保真安全性        | 初步通过，尚缺独立核验 |
+| 其他图像泛化         | 未验证         |
+| 是否继续投入 P1      | 是           |
+| 是否直接替换默认方案     | 否           |
+
+我对这轮实验的核心评价是：从 Executor Capacity Probe 找到的有效策略，已经初步成功迁移到了真实的自动 Compose 阶段。
+
+这是实质性的工程进展。下一步最值得投入的，不是继续提高全图 sharpness，而是同时回答三个问题：27B 能否稳定写对指令、Qwen 能否在文字等高保真区域准确执行、Verifier 能否把好的候选交付出去。 完成这三项后，才有足够依据判断 P1 对整体 HarnessIR 的实际提升。
