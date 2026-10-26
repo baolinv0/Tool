@@ -1,1 +1,21 @@
-test
+Dear [Name],
+
+Thanks for the outline. The direction sounds good to me. Keeping the same task, dataset and evaluation protocol, with PSNR measured on the quantized model, makes sense as the next step for the series.
+
+With November 4 approaching, I suggest we focus on getting the challenge section ready. It could cover:
+
+- **Motivation:** why integer quantization is worth studying and what this edition adds to the previous ones.
+- **Dataset:** the existing data, its availability for reuse, and a brief note on access and ethical considerations.
+- **Evaluation:** the existing scoring protocol, with PSNR from the submitted quantized model used for ranking and SSIM reported alongside it.
+- **Organization and schedule:** who will handle the challenge, and provisional dates for opening, submissions and results that fit the workshop’s schedule.
+
+For the baseline, a sentence or two should be enough: the starting kit is available, and quantization support is planned. We can mention PTQ, QAT and an offline checker without needing implementation details or new results for the proposal.
+
+We can also outline the intended storage, precision and operator constraints, leaving the exact limits and INT16 exceptions to be agreed after baseline validation. Those details do not need to form a complete rulebook at this stage.
+
+Could you share the proposal submitted for the previous edition, or the relevant challenge section? We could work from that and update it for 2027.
+
+Please also let me know the internal deadline for our text and who is putting the proposal together. I’m happy to help draft and review the technical section.
+
+Best regards,
+[Your Name]
