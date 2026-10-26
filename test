@@ -1,260 +1,75 @@
-# HarnessIR–Qwen 优化实验报告
-
-**报告版本：** v2.0（单文件版）  
-**实验日期：** 2026-10-23 至 2026-10-24  
-**系统：** Qwen-Image-2.1 Executor + Qwen 27B VLM  
-**实验阶段：** E1 Compose（含 E1b compose 重复性补充）  
-**状态：** E1/E1b 已完成；E2/E3/E4 未运行
-
-> 本报告所有视觉判断均为**实验执行者目检（非盲）**，独立盲评未执行（盲评材料已生成，见 §7）。原始图像与机读明细存于服务器 `runs/exp1_compose_ab/` 与 `runs/exp1b_compose_stability/`。
+盘点完毕。先给出现状，再给两分支计划。
 
 ---
 
-## 1. 核心结论（必填）
+# 一、现状：在原始 HarnessIR 上做过哪些尝试
 
-### 1.1 本轮做了什么
+原始代码是 2026-10-09 从 GitHub 下载的论文源码（非 git clone，本地无版本控制）。五阶段管线（diagnosis→tools→compose→execute→verify)**结构零改动**，所有尝试集中在四个层面：
 
-- **本轮目标：** 验证面向 Qwen 的两级保真 compose 策略（P1）能否在真实 HarnessIR compose 阶段改善"恢复不足"，且优势不依赖单次 compose 抽签。
-- **修改模块：** Compose（`harness/stages/compose.py` 增加 `HARNESS_COMPOSE_POLICY` 开关 + 新模板 `prompts/compose_p1.txt`）。
-- **对照方案：** P0（现行 compose 模板）vs P1（两级保真：Tier-1 严格保护 + Tier-2 有界重建许可）。
-- **实际样本：** E1 = 5 张 dev 图 × 2 臂 × 2 配对 seed（0/42）；E1b（评审补充）= 2 张图（0043/0049）× 2 臂 × 3 条独立 compose 指令 × 固定 seed 0。
-- **执行完成：** E1 20/20 成功；E1b 12/12 成功（含复用 E1 的 4 条 r1，新增 8 compose + 8 生成）。
-- **运行状态：** 正常，无失败、无重试、无中途变动。
+## 1. 模型替换层（`harness/settings.py`、`harness/clients.py` 重写，接口不变）
+- 云端 API → 全本地推理：VLM 诊断/组合/验证 = **Qwen3.8-27B**（备选 VL-8B)；执行器 = **Qwen-Image-2.1**（主）、Qwen-Image-Edit-2511、FLUX.2-klein-9B（对照）
+- 懒加载+进程缓存+推理锁；`vlm.chat_json()` / `mfm.edit()` 接口原样，各 stage 不动
+- 推理配置固定：steps=40 / true_cfg=4.0 / guidance=1.0 / seed=0
 
-### 1.2 本轮结果
-
-| 判断项目 | 结果 |
-|---|---|
-| 新方案是否改善 | 部分改善（结构改善稳定可复现；亮度改善不稳定，E1 亮度结论已被 E1b 修订） |
-| 最明显的改善 | 0043 运动模糊车体：P1 两 seed 重建出车轮与建筑立面；E1b 车 ROI sharp 3/3 compose 抽样 P1>P0（215/245/185 vs 180/166/173） |
-| 最严重的退步 | 0049：E1 中 P1 全图 luma 低 0.03–0.05（0.217/0.226 vs 0.249/0.273）；E1b 显示两臂亮度分布重叠，该退步同为抽样事件而非稳定属性 |
-| 是否存在新增内容错误 | 0（E1 20 张 + E1b 8 张新输出全部目检；无假字、无新增物体、无几何扭曲） |
-| 不同 seed 是否基本一致 | 是（E1 两 seed 逐图胜负一致）；compose 重抽一致性：结构优势 3/3 可复现，旗舰效应（车轮重建）仅 1/3 |
-| 是否达到预设通过条件 | 是（改善多于退步、seed 一致、无新严重错误；未以 sharpness 倍数判决） |
-| 是否建议进入下一阶段 | 条件通过（P1 进入 E4 组件池；不替换默认策略；先做 E2/E3） |
-
-**本轮最终结论：**
-
-P1 compose 在真实 HarnessIR compose 阶段有效：结构恢复优势在 2 个 executor seed 与 3 次独立 compose 抽样下均可复现（事实）。但"P1 更亮"在 compose 重抽下不成立，E1 的亮度结论含抽签成分（事实，已修订）。车轮重建等旗舰效应依赖 compose 抽到的指令特异度（r1 有完整终态句则重建，r2/r3 无则无），说明 P1 模板方向正确但不保证指令质量稳定（事实+少量推断）。P1 产物跨抽样方差显著小于 P0（事实），这对自动系统本身有价值。
-
----
-
-## 2. 实验条件（必填）
-
-| 配置 | 实际设置 |
-|---|---|
-| 服务器代码版本 | 无 Git 仓库；关键文件完整 SHA-256 快照：`prompts/compose.txt` 2b6fa958…、`prompts/compose_p1.txt` 6e80cdd6…、`harness/stages/compose.py` 8d80f8c9…、`harness/stages/execute.py` d169d28a…、`tools/exp1_compose_ab.py` ba1707ad…、`tools/exp1b_compose_stability.py` 334848ff…（全量 29 条含逐条 prompt 哈希，见 `runs/exp1_compose_ab/SHA256SUMS.txt`） |
-| Qwen Executor | Qwen-Image-2.1 本地 checkpoint（31GB，`model_index.json` SHA-256 cf1ecd10…f7809 为指纹，无上游 revision），QwenImage21Pipeline，bf16，未量化 |
-| VLM | Qwen3.8-27B（vLLM `qwen38_27b` @ :8002，`--reasoning-parser qwen3`）；diagnosis/compose 均 temp 0.6 / top_p 0.95 / top_k 20，max_tokens 8192，thinking 开启（内容入 `reasoning_content`，仅解析 content） |
-| Executor 推理 | steps 40、true_cfg 4.0、negative prompt `" "`（单空格）、E1 seed {0,42}、E1b seed {0} |
-| 输入/输出分辨率 | 1024×1024 → 1024×1024（数据集已统一，无 crop/pad） |
-| 是否使用工具 | 使用：stage 1 诊断 + stage 2 工具（focus/depth/seg 等）+ visual pack，两臂共享同一套冻结证据 |
-| redo | 关闭（本轮只评首轮单生成） |
-| 后处理 | 无（仅 RGBA→RGB 转换，修复历史 alpha 污染；不改像素内容） |
-| 指标口径 | luma = RGB 加权灰度均值/255；sharp = 灰度 Laplacian 方差；E1 为全图口径，E1b 增加命名 ROI（0043 车体 (0,0.5,0.5,0.95)、0049 招牌带 (0.1,0.05,0.75,0.55)） |
-
-**对照控制：**
-
-- 两组保持不变的条件：诊断、工具证据、text_evidence（E1b 逐字节复用 E1 存档）、visual pack（E1b 由同一证据重建，entry roles 校验与 E1 完全一致）、执行器、输入、seed、全部推理参数。
-- 本轮实际改变的条件：compose 策略模板（P0/P1）；E1b 另将"compose 指令本身"作为被抽样变量（每臂 3 条独立指令）。
-- 是否发生计划外变动：无。
-
-**复现命令：**
-
-`CUDA_VISIBLE_DEVICES=0 python3 tools/exp1_compose_ab.py`（E1）；`CUDA_VISIBLE_DEVICES=0 python3 tools/exp1b_compose_stability.py`（E1b）
-
----
-
-## 3. E1：Compose 策略实验
-
-**状态：** 已完成（含 E1b 重复性补充）
-
-### 3.1 实验假设
-
-针对 Qwen 的 Compose 策略，明确恢复目标，并对受退化破坏的区域允许有界重建，能在保持内容一致性的同时改善恢复不足。
-
-- P0：原有 Compose（现行模板，保真条款无例外许可）。
-- P1：面向 Qwen 改进后的 Compose（两级保真模板）。
-
-### 3.2 实际策略差异
-
-| 项目 | P0 | P1 |
+## 2. Prompt/策略层（`prompts/` + `harness/stages/compose.py` 唯一一处逻辑改动）
+| 时间 | 尝试 | 结论 |
 |---|---|---|
-| 恢复目标描述 | 泛化（"restore to clean state"类），无区域终态 | 区域化、可检查终态（"a rear wheel that reads as a wheel with a defined rim"） |
-| 对结构重建的限制 | 一刀切："do not invent detail in regions that hold no recoverable information"，无例外 | Tier-2 有界许可：被 blur/underexposure 破坏处允许与残存证据一致的重建 |
-| 文字、身份与几何保护 | 与重建限制混在同一保真条款（易被一并涂平） | Tier-1 单列：人脸/文字/几何/已清晰结构严格保护，与 Tier-2 解耦 |
-| Prompt 长度或复杂度 | 3885–4634 字符（5 图） | 4108–5244 字符（5 图） |
+| 10-12 | A/B/C/D 对照（baseline prompt vs 完整 harness prompt vs 删保守条款 vs 简洁版） | 完整 harness prompt **显著压暗**；保守条款有抑制但非全部原因 |
+| 10-13 | 旧 P0/P1/P2 三臂（manifest baseline / in-framework / Qwen 专用 prompt v1) | in-framework 几乎不提亮；Author(NB2云端） > P0≈P2 > LQ > in-framework |
+| 10-23 | `compose_blocks.txt`/`verify_blocks.txt`(v27 工具证据块） | 支撑 redo 批次 |
+| 10-24 | **新 P0/P1**:`compose_p1.txt` 两级保真模板 + `compose.py` 里 `HARNESS_COMPOSE_POLICY` 开关（默认 p0) | E1 条件通过：2 WIN + 2 WIN~ + 1 TIE,0 回归 |
 
-**关键 Prompt 原文节选（0043 实发，全文及哈希见证据包）：**
+## 3. 实验层（`tools/`、`compare/`，全部新增、不碰管线）
+- `probe_executor_capacity.py`:**A→C→D→G 探针**（同 ROI/种子）—— 终态目标贡献 +405%,licence 再 +53%,cfg 4→6 仅 +6.5% → **prompt 是主瓶颈，cfg 不是**
+- `exp1_compose_ab.py`(E1:5图×P0/P1×2种子）、`exp1b_compose_stability.py`(E1b:compose 可重复性）
+- E1b 关键教训：单次 compose 抽样不足以评估策略（P1 方差≪P0;wheel 重建率 1/3 跟随指令特异性）；**"P1 更亮"结论已被正式推翻**
+- `compare/` 下 13 个探针/网格/盲评脚本；`manifest_ll_full25.json`(25 图清单）
 
-P0：
-> "The first priority is fidelity: keep the exact scene content, geometry, structure and position of every object; … and do not invent detail in regions that hold no recoverable information."
+## 4. 基础设施层
+- `run_harness.py`/`run_baseline.py` 适配；`relay_server.py`;9/9 IQA 指标生产路径实测
+- 证据/归档体系：证据包 tar.gz + SHA256SUMS 快照 + 迁移指针（外部评审要求）
+- 报告：`EXP1.md`（含 §12 评审回复）、v2.0 单文件总报告
 
-P1：
-> "The silver sedan … is smeared by camera movement across its body and wheels; restore it to a coherent sedan with a clean roofline, a defined door line and panel edges, and a rear wheel that reads as a wheel with a defined rim, all consistent with the surviving shape and without adding parts the smear does not support."
+## 明确没动的 & 已卡住的
+- **没动**:5 阶段结构、verify 阶段、execute 几何链（1024 pad/crop)、零后处理原则
+- **卡住**:0024 类提亮失败（执行器曝光锚定假说，compose 层杠杆已穷尽；后处理方案违反零后处理原则，**待你决策**);E2/E3/E4 未跑；P1 默认化 pending E4
 
-### 3.3 逐图结果（E1：2 配对 seed）
+---
 
-| 图像 | Seed 0：P1 vs P0 | Seed 42：P1 vs P0 | 主要变化 | 内容错误 |
-|---|---|---|---|---|
-| night_0043 | 胜 | 胜 | 车轮+轮毂重建、立面纹理、更亮；车体仍部分涂开 | 无 |
-| night_0049 | 平 | 平 | P1 光晕略收敛但更暗；招牌文字两臂均不可读 | 无 |
-| night_0042 | 胜（弱） | 胜 | 暗部提亮（s42 明显），斑马线结构相当 | 无 |
-| night_0024 | 平偏胜 | 平偏胜 | P1 更亮、噪声底清除；深影区仍未提亮到指令要求 | 无 |
-| night_0028 | 平偏胜 | 平偏胜 | P1 更亮、天空可见；尾灯控制相当；无假字 | 无 |
+# 二、两分支计划
 
-**关键数值（luma / 全图 sharp；sharp 为辅助指标，不代表真实恢复能力）：**
+## 分支 1:Qwen-Image-2.1 模型本体直接测试（无 harness)
 
-| 图像 | LQ | P0（s0/s42） | P1（s0/s42） |
+> 目的：建立**模型能力上限与失败分类学**——回答"harness 里哪些失败是 compose 可修的、哪些是执行器天花板"。假设你说的"qwen本身"指图像执行器（若含 27B compose VLM 可另加一小项）。
+
+| 编号 | 实验 | 内容 | 产出 |
 |---|---|---|---|
-| night_0043 | 0.152 / 34.5 | 0.124 / 261.6 ；0.126 / 222.4 | 0.190 / 244.6 ；0.199 / 256.4 |
-| night_0049 | 0.209 / 110.2 | 0.249 / 386.6 ；0.273 / 312.9 | 0.217 / 313.2 ；0.226 / 271.4 |
-| night_0042 | 0.151 / 53.2 | 0.141 / 171.2 ；0.150 / 150.9 | 0.178 / 223.6 ；0.223 / 265.1 |
-| night_0024 | 0.138 / 46.5 | 0.095 / 116.3 ；0.109 / 133.8 | 0.128 / 191.2 ；0.129 / 158.8 |
-| night_0028 | 0.132 / 48.1 | 0.135 / 416.4 ；0.147 / 444.5 | 0.196 / 398.0 ；0.201 / 360.9 |
+| B1.1 | **能力阶梯图** | 固定 6 张硬图（0024 曝光/0043 车模糊/0049+0028 文字/0042 斑马/0049 过亮），prompt 风格阶梯（短指令→终态→终态+licence)× {cfg 2/4/6} × {steps 28/40}，种子 0+42 | 每图"天花板曲线"：ROI sharp/luma vs prompt 层级；明确 compose 还能榨出多少 |
+| B1.2 | **曝光可控性**（最优先，直接服务 0024 决策） | 显式曝光目标语言剂量响应：EV/-stop 语义、"dim but readable" vs "bright daylight"、luma 锚定句式；测输出 luma 单调性 | 判定执行器是否"听得懂"曝光指令 → 决定 0024 走 compose 显式曝光目标 还是 专用提亮轮 |
+| B1.3 | **文字重建上限**(E2 模型侧） | "highball"/"25 hours"/"UNL"/"PARK" 逐字指令直测，含/不含位置描述 | 执行器字形保真上限 → E2 失败定位的模型侧基线 |
+| B1.4 | **固 prompt 种子方差** | n=5 种子 × 3 档 prompt，固定图 | 模型固有方差底噪（校准 E1b 的 compose 方差结论） |
 
-| 指标 | P0 | P1 | 解释 |
+**交付物**:《Qwen-Image-2.1 low-light 能力卡》——每个失败类别标注"compose 可修 / 需换 executor / 模型不可达"。
+
+## 分支 2：系统级（harness 内）以端到端提升为目标
+
+| 优先级 | 实验 | 依赖/输入 | 成功判据 |
 |---|---|---|---|
-| 改善/持平/退步图数 | — | 改善 2（0043/0042）、平偏胜 2（0024/0028）、平 1（0049）、退步 0 | 以图像为单位（n=5），seed 不作独立样本 |
-| 目标暗部亮度 | 见上表 | 4/5 图 P1 更高 | **经 E1b 修订：跨 compose 重抽不稳定，非 P1 稳定属性** |
-| 目标区域 sharpness | 0043 车 ROI：180.3（s0） | 同 ROI：214.1（s0）、144.6（s42） | ROI 口径；E1b 有完整 3-rep 数据（§3.4 末） |
-| 严重内容错误数 | 0 | 0 | — |
+| P2 | **E1.5** compose 特异性工程化：P1 vs P1+逐区强制"reads as …"终态句，3 compose 抽样×seed0,0043 | B1.1 的天花板作对照 | 高特异性率 1/3→3/3 |
+| P1 | **E2** 转录臂：0049+0028,T0/T1-auto-27B/T2-verified，同 P1 底+种子，逐字核对 4 个串 | B1.3 基线 | 失败定位：T2挂→执行器；T1挂+T2过→转录层 |
+| P3 | **E3** verifier 回放：固定候选池（23 redo+20 E1+8 E1b),ROI 规则（不用全局 luma_lift 硬规则） | 候选池已就位 | verifier 排序 vs 人工排序一致率 |
+| P4 | **E4** 25 图 S0/S1:compose 多抽样纳入设计，dev5 与其余 20 分开报告 | E1.5+E3 结论 | P1 是否默认化的最终依据 |
 
-### 3.4 代表性案例
+**汇总裁决**（分支1×2 交汇）:
+- 0024 类：B1.2 结果 → 选"compose 显式曝光目标"/"专用提亮轮"（后处理方案默认排除，除非你改主意）
+- 0043 类：B1.1 天花板 vs E1.5 实际值 → 差距即 compose 剩余空间
+- 执行器选择：若 B1 显示 Qwen-Image-2.1 在某类全面低于 Edit-2511,E4 加一臂
 
-**成功案例：night_0043（严重运动模糊）**
-
-- 输入存在的问题：前景银车整车涂开、无车轮；建筑立面糊成一片；全图 sharp 34.5。
-- P0 结果：两 seed 均仍重度拖影、无车轮、更暗（luma 0.124/0.126，低于 LQ 的 0.152）。
-- P1 结果：两 seed 均重建出带轮毂的后轮、车门缝线与立面窗框纹理；luma 0.190/0.199；车体中部仍偏软（恢复不充分，但见 §8-B 的稀释解释）。
-- 恢复充分性：部分充分——结构先验强的部件（车轮）重建成功，大面积面板纹理未恢复。
-- 内容保真：物体数量/位置/颜色一致，无新增部件（prompt 有界："without adding parts the smear does not support"）。**注意：无 GT，重建车轮是"合理且一致的结构"，不能宣称是真实细节还原。**
-- 判断依据：全尺寸 PNG 目检（执行者，非盲）+ 车 ROI sharp（P1 s0 214.1 vs P0 s0 180.3）+ prompt 原文。
-
-**失败或退步案例 1：night_0049（霓虹招牌 + 光晕 + 抖动）**
-
-- 问题表现：P1 全图 luma 两 seed 均低于 P0（0.217/0.226 vs 0.249/0.273）；招牌文字两臂均保持涂开不可读。
-- 最可能的原因（假设）：文字/招牌恢复需要转录注入（E2 范畴），P1 的两级保真对"高保真文字区"只给严格保护不给内容，executor 无据可依只能保持涂开；亮度退步为 compose 抽样差异（E1b 显示两臂 luma 分布重叠：P1 0.204–0.217 vs P0 0.218–0.338）。
-- 是否已排除其他解释：部分——E1b 三个 P1 抽样亮度一致偏低于 P0 r1/r3，不能完全排除 P1 在该图系统性偏暗；但 P0 r3 出现过亮离群（0.338，路面泛白），说明 P0 亮度本身也是抽样事件。
-
-**失败或退步案例 2：night_0024（极暗室内猫）——prompt 强指令仍未换来提亮**
-
-- 问题表现：P1 prompt 明确要求"The lift must be substantial and immediately visible… open them until the rug's swirling medallion pattern… identifiable"，但输出深影区均值不升反降：LQ 深影区 mean 0.139 / std 0.119 → P1 s0 mean 0.104 / std 0.173。
-- 数据解读（事实+推断）：std 上升说明真实图案对比浮现、噪声底被清除（LQ 的"亮"含噪声底成分）；但 mean 下降说明**提亮指令未被执行到底**。
-- 最可能的原因（假设）：Qwen-Image-2.1 为图像条件生成，输入曝光是强锚点，文字指令压不住（与此前探针中"NB2 裸跑 luma 0.252 vs Qwen 管线 0.185"的先验差异一致）。
-- 是否已排除其他解释：未完全排除（未做曝光目标/二次提亮消融）；compose 端已确认无责（指令足够强硬）。
-
-**E1b 补充（compose 重复性，评审问题 2）：**
-
-0043 三个独立 P1 compose 抽样中，车轮终态语言逐次衰减（r1：完整"reads as a wheel with a defined rim"→车轮重建；r2：仅"defined rim"→无；r3：仅"door line"→无），车 ROI sharp 仍 3/3 高于 P0（214.1/245.2/184.6 vs 180.3/165.9/172.9）。0049 两臂招牌 ROI 不可分。P1 跨抽样输出方差显著小于 P0（0043 全图 sharp 极差 22 vs 139；0049 luma 极差 0.013 vs 0.120）。
-
-### 3.5 E1 判决
-
-- **验证到的事实：** ①P1 结构改善在 2 seed × 3 compose 抽样下可复现（0043 车 ROI）；②P1 零新增内容错误（28 张目检）；③P1 输出跨 compose 抽样更稳定；④0049 亮度-光晕存在权衡；⑤0024 提亮指令未被 executor 执行到底。
-- **尚未证明的机制：** ①改善中"终态目标"与"重建许可"各自贡献未在本轮分离（此前探针在同一 ROI 上有部分分离：A 118.9 → C 仅终态 601.0 → D 加许可 920.2，提示终态目标占大头）；②车轮重建与指令特异度的剂量关系仅 3 个样本，是同向相关而非确立因果；③0024 的"执行器曝光锚定"是假设不是事实。
-- **结论：** 有条件通过。
-- **下一阶段需要检查：** compose 指令特异度的稳定性（E1.5 候选）；文字恢复（E2，T0/T1/T2）；verifier 在固定候选池上的选择质量（E3）；E4 端到端须把 compose 多次抽样纳入设计。
+## 资源与执行顺序
+- **GPU 现状**:1、4 空闲；5/6/7 的闲置 vLLM(245GB）可杀 → 分支1（执行器 ~40GB）放 GPU4，分支2(27B VLM ~55GB + 执行器）放 GPU1/5，两分支**可并行**
+- **顺序建议**：先 B1.2（半天内出结果，解锁 0024 决策）+ E1.5（已有工具链，改动最小）；B1.1/B1.3 与 E2 并行；E3 纯 CPU 回放随时插缝；E4 最后
+- 全程沿用 E1 证据标准：index.json + SHA256 + 结论/修订记录
 
 ---
 
-## 4. E2：文字转录与恢复实验
-
-**状态：** 未运行
-
-> 仅记录此前探针阶段的预备观察（非本轮实验，不计入 E2 成绩）：在 0049 上，5/5 条注入转录的臂渲染出正确的 "highball"，5/5 条仅给重建许可的臂产生自信的错误字形——提示文字恢复需要"转录注入"而非"许可"；27B 从原始 LQ 自动读字的可靠性尚未系统验证。E2 计划：0049/0028，T0（无转录）/T1（27B 自动转录并冻结后注入）/T2（核实 oracle 注入），同一 P1 基底与 seed。
-
----
-
-## 5. E3：Verifier 候选选择实验
-
-**状态：** 未运行
-
-> 预备候选池已存在：`runs/full25_redo4/`（23 张 redo 候选）+ 本轮 E1 的 20 张 + E1b 的 8 张。已知问题：redo 全量运行中 verifier 曾把更暗候选交付（night_0024），且旧 verifier 无 ROI 数值证据。E3 计划：固定候选池、在输入 LQ 上冻结暗部/高光/模糊 ROI，V0（现行）vs V1（+ROI 数值），不用全局 `luma_lift<=0` 硬拒。
-
----
-
-## 6. E4：完整系统 25 张 A/B
-
-**状态：** 未运行
-
-> 计划：S0 = 现行管线（含已修复 bug）；S1 = S0 + 通过验证的组件（目前仅 P1 compose 为候选，E2/E3 结果决定是否加入转录与新 verifier）。两臂 redo 预算一致；dev 5 图与其余 20 图分开统计；**compose 多次抽样纳入设计**（E1b 教训：单次 compose 抽样不足以评估策略）。
-
----
-
-## 7. 异常及结论限制
-
-| 问题 | 实际情况 | 是否影响结论 |
-|---|---|---|
-| 生成失败或重试 | 无（E1 20/20、E1b 12/12） | 不影响 |
-| 输入/输出尺寸不一致 | 无（全程 1024×1024） | 不影响 |
-| RGB、alpha 或指标错误 | 历史指标曾被 RGBA alpha 污染；本轮前已修复（execute.py 与探针脚本统一 RGB 转换），本轮全部按 RGB 口径计算 | 本轮指标可信；此前 redo 全量运行的旧指标仅定性参考 |
-| Prompt 或参数中途改变 | 无 | 不影响 |
-| 缺少 GT 或文字真值 | 数据集无 GT：0043 车轮等重建结构只能报告"合理且一致"，不能宣称真实还原；文字真值未核实（E2 才涉及） | 限制结论措辞，已按此表述 |
-| 未进行独立盲评 | 是——全部视觉判断为执行者目检（非盲）；盲评材料已备（X/Y 盲标 grid + `blind_key.json` + 证据包 `EXP1_evidence_pack.tar.gz` 2.2MB/29 文件） | 结论强度降一级，待独立复核 |
-| 其他 1：E1 亮度结论被 E1b 修订 | E1 称"4/5 图 P1 更亮"；E1b 三个独立 compose 抽样显示两臂 luma 分布重叠 | 已修订：亮度非 P1 稳定属性 |
-| 其他 2：指标口径演进 | E1 用全图 sharp；E1b 起增加命名 ROI（0043 车体、0049 招牌带） | 全图 sharp 已证实与目检背离（0049/0028），判决以 ROI+目检为准 |
-| 其他 3：E1b 的 visual pack 为重建 | E1b 复用 E1 证据重建 visual pack，entry roles 与 E1 存档完全一致；caption 为同一证据的确定性函数 | 不影响（结构已校验一致） |
-
----
-
-## 8. 最终研究判断（必填）
-
-### A. 已经证实的结论
-
-1. **P1 compose 的结构恢复优势可复现。** 0043 车 ROI sharp：E1 两个 seed P1>P0（214.1/144.6 vs 180.3/NA），E1b 三个独立 compose 抽样 P1 全胜（214.1/245.2/184.6 vs 180.3/165.9/172.9）；逐图胜负 5 图 × 2 seed 无倒退。
-2. **P1 不引入新增内容错误。** E1 20 张 + E1b 8 张新输出目检：无假字、无新增物体、无几何扭曲；0028 路面 "UNL" 字形为 LQ 已有内容。
-3. **P1 产物跨 compose 抽样更稳定。** 0043 全图 sharp 跨 3 抽极差：P1 22 vs P0 139；0049 luma 极差：P1 0.013 vs P0 0.120（P0 含 0.338 过亮离群）。
-4. **compose 指令特异度决定重建幅度。** 0043 三个 P1 抽样：终态语言完整（r1）→车轮重建；语言衰减（r2/r3）→无重建。探针同 ROI 序列佐证：A（现行风格）118.9 → C（具体终态）601.0 → D（终态+许可）920.2。
-5. **全图 sharp/luma 不可作判决指标。** 0049/0028 全图 sharp P0 更高但目检 P1 不劣；0049 P1 更亮结论被 E1b 证伪。
-
-### B. 目前较合理，但仍属于假设的解释
-
-1. **"许可被长 prompt 稀释"解释 0043 恢复不充分**：P1 车 ROI 214 远低于探针 D 臂 920（同模型同参数同 seed），推断是 687 词多约束 prompt 稀释了去模糊信号。替代解释（seed 差异、措辞风格差异）未排除。
-2. **"执行器曝光锚定"解释 0024 提亮失败**：prompt 强指令下深影区 mean 仍降（0.139→0.104），推断图像条件锚定输入曝光。替代解释（VAE/调度器特性、训练数据先验）未分离；"噪声底消失造成表观变暗"已部分证实（std 0.119→0.173 真实图案浮现）。
-3. **0049 P1 偏暗是否为系统性**：3 个 P1 抽样亮度一致偏低，但 P0 方差极大，抽样数不足以判决。
-
-### C. 没有得到支持或失败的方案
-
-1. **"P1 稳定提亮暗部"——被 E1b 证伪**（luma 分布两臂重叠）；亮度只能逐次评估，不能作为 P1 卖点。
-2. **"一刀切保真条款"（P0 风格）——恢复不足的根因之一**（探针 A→C/D 因果链 + 本轮 P0 对照），失败原因明确：无例外许可 + 无区域终态。
-3. **纯许可式文字恢复——此前探针已证伪**（5/5 许可臂产出自信假字），E2 须走转录注入。
-
-### D. 仍未解决的问题
-
-1. compose 指令质量的稳定性：P1 模板 3 次抽样仅 1 次产出高特异度指令（E1.5：模板强化 / best-of-n compose / 指令自检）。
-2. 文字恢复：VLM 自动读字可靠性与 executor 绘字能力未分离验证（E2）。
-3. verifier 在固定候选池上的选择质量（E3）；redo 运行中已观察到选更暗候选案例。
-4. 执行器曝光锚定的可行杠杆：显式曝光目标 / 提亮专用第二轮 / 后处理曲线（后者破坏零后处理原则，需决策）。
-5. 独立盲评未执行。
-
-### E. 下一轮实验
-
-**优先级 1：E2 文字转录与恢复（评审指定顺序）**
-
-- 最小实验：0049 + 0028；T0/T1/T2 三臂同一 P1 基底、同一 seed；T1 转录生成后冻结再注入；逐字核对 "highball"/"25 hours"/"UNL"/"PARK"。
-- 成功标准：T2 臂目标文字逐字正确；T1 与 T2 的差距定位到"读字"还是"绘字"；无新增假字。
-- 失败后如何定位：T2 失败 → executor 绘字能力上限；T1 失败而 T2 成功 → 读字/转录传递问题；布局漂移 → 区域锚定不足。
-
-**优先级 2：E1.5 compose 指令特异度工程**
-
-- 最小实验：0043 单图，P1 模板 vs P1+特异度强化（要求逐区域给出"reads as …"终态句），各 3 次 compose 抽样 × seed 0。
-- 成功标准：高特异度指令产出率从 1/3 提升到 3/3；车 ROI sharp 不降；无内容错误。
-
-**当前工程决定：** 条件采用 P1 compose（`HARNESS_COMPOSE_POLICY=p1` 可选开关；默认仍为 P0，待 E4 通过后切换）。暂不采用：全局 luma/sharp 作为选择或判决标准。
-
----
-
-## 9. 最终交付自检
-
-- [x] 全部内容集中在一个 Markdown 文件。
-- [x] 实际执行阶段（E1/E1b）、样本数、seed、配置完整。
-- [x] 结果按图像汇总（n=5 图 / n=2 图），没有把 seed 当成独立样本。
-- [x] 给出了关键数值（逐图 luma/sharp 表、车 ROI 三抽数据）、成功案例（0043）和失败案例（0049、0024）。
-- [x] 没有把 sharpness 倍数当作真实恢复能力倍数（探针倍数仅作机制指示）。
-- [x] 没有把人工转录结果当成端到端自动系统成绩（E2 未运行，探针观察已标注不计成绩）。
-- [x] 区分执行者目检（全部视觉结论）、自动指标（luma/sharp/ROI）和未经验证的推断（§8-B 全部标注假设）。
-- [x] 未运行的实验明确标注"未运行"（E2/E3/E4）。
-- [x] 下一轮实验有具体对照及通过标准（E2、E1.5）。
-
-
-
+**待确认的两点**:① 分支 1 的"qwen 本身"是仅指 Qwen-Image-2.1 执行器，还是也包含 27B compose VLM 的本体测试（如 oracle region-notes 下 compose 质量上限）?② GPU 5/6/7 上 stage-model-lab 的闲置 vLLM 是否可以清掉？确认后可切 Act 模式从 B1.2 + E1.5 开工。
