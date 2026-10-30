@@ -1,113 +1,129 @@
+Tone Mapping Algorithm Design 2026
 
-这是去年的人物概况，今年的变动
-数据部分：
-第一部分数据不变
-第二部分数据采用大模型进行增强，适应新的传感器，就是GGT-100K reference
+The tone mapping method converts high-bit-depth linear RGB into display-ready sRGB through two stages. Stage 1 performs adaptive exposure compensation and tone mapping at low resolution. Stage 2 combines this tone guidance with full-resolution image features to refine local contrast and detail. Training uses paired camera data and generative-model-assisted targets for the target sensor. Qualitative assessment is generally satisfactory, while balancing shadow visibility with highlight gradation in challenging HDR scenes remains the main limitation.
 
-网络部分：
-整体架构仍然是两阶段，第一段加一个global 自适应，作为补充曝光，避免不同传感器 isp pipeline 上游AE对TM的影像
-第二阶段不变
+2.9.1 Background
 
-结果：
-整体还可以
-但是hdr场景，暗部细节与过曝区域平衡的还不是很好
+In a mobile image signal processor (ISP), tone mapping converts high-bit-depth linear RGB into an sRGB image for standard dynamic range display. It compresses the captured luminance range while preserving natural appearance and visible detail, addressing the tone reproduction problem studied in photographic rendering [1].
 
-I Tone Mapping
-2.9.1	Background
-HDR imaging captures a wide range of luminance levels, preserving details in both the brightest and darkest areas of a scene. However, when displaying or reproducing these HDR images on devices with limited dynamic range. The primary goal of HDR tone mapping is to compress the wide range of luminance levels present in an HDR image into a range that can be properly displayed on standard monitors. This process involves mapping the high dynamic range of luminance values to the more limited dynamic range of the display device while retaining as much detail and contrast as possible, considering factors like local contrast enhancement, preserving details in highlights and shadows, color preservation, and overall image appearance to create visually appealing results, such as shown in following figure.
- 
-     
-Currently, both global and local methods for HDR tone mapping have been explored using traditional techniques and deep learning-based approaches. Global TM functions are good for capturing overall preview of the input image. Local TM function by considering pixel neighborhood information for each input pixel, can emphasize more local details. 
+Sensor-specific tone mapping requires attention to both input exposure and target appearance. Sensor response and upstream automatic exposure (AE) and ISP processing affect the linear RGB distribution, while training targets determine the brightness, contrast, and color that the network learns to reproduce. The method addresses these factors through exposure compensation in the low-resolution stage and training supervision matched to the target sensor.
 
-1.	Global Operator
- These methods uniformly adjust the entire image's contrast and brightness. Although it is straightforward, they might not preserve fine details or local contrast effectively.
-a) Traditional global methods often involve techniques like gamma correction, or Reinhard's method. These adjust the entire image globally and are computationally less intensive. Reinhard et al.'s method [10-2] is popular for its simplicity in maintaining local contrast and overall image appearance.
-b) Deep learning models have been employed for global HDR tone mapping. These networks learn to map HDR images to a tone-mapped version directly [10-8]. They might use convolutional neural networks (CNNs) to learn complex mappings from input HDR images to visually appealing tone-mapped outputs.
-2.	Local Operator
-These methods consider local image characteristics to preserve details better. 
-a) Traditional local methods focus on specific regions or details within the image [10-4]. These include algorithms like the Bilateral Filter [10-5], which preserves edges while adjusting contrast, and various gradient-based techniques. They tend to enhance local contrast and detail while maintaining smoothness in homogeneous regions.
-b) Deep learning: These models focus on enhancing specific areas or details in the HDR image. They may employ architectures like U-Net[10-7], which are designed for tasks involving local feature enhancement or segmentation. These networks can learn to selectively adjust different parts of the HDR image to improve local contrast and details.
-Practical applications might involve a combination of these methods to achieve a specific goal in HDR tone mapping [10-6]. In recent years, the combination of deep learning and traditional methods has also been explored, where deep learning models might learn from the strengths of traditional algorithms to enhance their performance or learn more efficient representations for HDR tone mapping.
-The commonly adopted loss functions in tone mapping models include reconstruction loss (L1, L2, SSIM), perceptual loss, smoothness loss. Besides, according to different demands and formulations, the color loss, exposure loss, and adversarial loss are also adopted. 
-2.9.2	Purpose
-In the context of an Image Signal Processor (ISP), tone mapping plays a critical role in adjusting and enhancing the dynamic range of images captured by a camera sensor before they are finalized for display or further processing. The ISP starts by receiving data from the camera sensor, which contains information about the light captured by the sensor's pixels. This raw data often has a high dynamic range, capturing details in both bright and dark areas. Then, ISP performs demosaicing, converting the raw sensor data into a full-color image.  Next, adjusting the dynamic range of the image to ensure it's suitable for display on standard monitors or devices. The ISP employs tone mapping to compress the high dynamic range captured by the sensor into a range compatible with the capabilities of typical displays. Specifically, tone mapping in ISP serves two primary purposes: enhancing image brightness and improving image contrast. As shown in figure, when taking the photo, tone mapping improves the brightness and contrast of captured photos after SW-ISP.
- 
-Our task is to implement a locally-adaptive tone mapping operator that optimally compresses the high dynamic range without sacrificing visual fidelity, including brightness and color adjustment as well as detail enhancement. The task aims at achieving natural brightness and color reproduction, while simultaneously preserving rich detail in both overexposed highlights and underexposed shadows.
-2.9.3	Challenge
-1.	High robustness in various scenes. 
-Handle backlit (high contrast), uniformly exposed (avoid flatness), and extremely dark (prevent lost details) images.
- 
-2.	Detail Preservation 
-Retain sky cloud depth, natural skin texture; avoid artifacts like blurring or color blocks.
- 
-3.	High speed required
-Total processing time <100ms for 3K*4K image on Qualcomm GPU.
-2.9.4	Dataset Setup
-This method combines a proprietary, in-house collected dataset with public datasets to achieve robust training results.
-1.	In-house Collected Dataset
-a)	Collection Device: iPhone ProRaw.
-b)	Data Content: For the same scene, the following can be captured simultaneously:
-i.	16-bit Linear RGB Image (RAW): As the model's original input.
-ii.	8-bit sRGB Image (JPG/HEIC): As the model's final GT.
-c)	Usage:
-i.	Used to train Stage 1 (16-bit Linear -> 8-bit GT, both at 1/8 resolution).
-ii.	Used to fine-tune Stage 2 (16-bit Linear @ Full-Res -> 8-bit GT @ Full-Res).
+Efficient learned enhancement methods such as HDRNet combine low-resolution prediction with full-resolution image processing [2]. The architecture described here uses low-resolution RGB tone guidance and a full-resolution refinement network.
 
-2.	Stage 2 Pre-training Data (Public)
-a)	For open data, there is no specific dataset dedicated to enhancing contrast, so we employ a dehazing dataset. The objective of the dehazing task is to clarify images, which is equivalent to the effect we aim to achieve by increasing contrast. We utilize RESIDE-OUT Dataset [10-11], which comprises 6000 images. As shown in the figure, the left image is the input, and the right image is the ground truth.
-b)	Usage: Used for pre-training the Stage 2 U-Net to learn general contrast and detail enhancement capabilities.
- 
-3.	Stage 2 Fine-tuning Data (Custom-made)
-a)	Data Source: The 8-bit sRGB GTs from the in-house dataset.
-b)	Processing Method: Apply a series of degradation data augmentation operations to the 8-bit GTs, such as Gaussian Blurring, adding noise, etc
-c)	Usage: To construct (degraded image -> original GT) pairs for fine-tuning the Stage 2 U-Net. This allows the network to specifically learn how to recover "sharp" details from a "less clear" image, perfectly matching the task objective.
+2.9.2 Purpose
 
-For testing, we took 50 photos with a iPhone and took 30 photos with a Samsung phone as test images. For Samsung, we use the 16-bit linear image which is demosaiced and denoised from the Bayer pattern by the ISP.
+The objective is to produce display-ready sRGB images with natural overall brightness, consistent color, and visible local detail across normally exposed, backlit, and low-light scenes. Subject brightness should remain appropriate relative to the background, and shadow enhancement should preserve highlight gradation.
 
+Stage 1 handles adaptive exposure compensation and low-resolution brightness and color mapping. Stage 2 refines local contrast and detail at full resolution. Generated training targets provide appearance supervision under the target sensor's imaging conditions.
 
-2.9.5	Solution Design
-AI Tone Model  adopts a cascaded two-stage neural network structure, decomposing the complex tone mapping task into two sub-tasks:
-Stage 1 (Global Enhancement): Responsible for the primary dynamic range compression, brightness adjustment, and color space transformation. This stage operates at 1/8 low resolution, mapping the 16-bit linear RAW data to an intermediate 8-bit tonal space, efficiently resolving primary brightness and color issues.
-Stage 2 (Local Enhancement): Responsible for enhancing local contrast and detail at the original resolution. This stage fuses the global tone information from Stage 1 with the detail information from the original image, resulting in an output image with clearer textures and richer details.
-Finally, the two stages work synergistically to achieve an end-to-end conversion from a high-bit-depth, high-dynamic-range linear input to a low-bit-depth, display-ready sRGB output.
- 
-1.	Stage 1: Brightness & Color Enhancement U-Net
-a)	Objective: To perform the non-linear mapping from 16-bit linear space to an 8-bit tonal space, handling global brightness and color.
-b)	Network Structure: U-Net.
-c)	Input: 1/8 resolution 16-bit linear RGB image.
-d)	Output: 8-bit RGB image (at 1/8 resolution, as a fusion feature for Stage 2).
-e)	GT (Ground Truth): The corresponding 1/8 resolution 8-bit sRGB image (processed by the default iPhone ISP and downsampled).
-2.	Stage 2: Detail Enhancement U-Net
-a)	Objective: To fuse global tone with original details at the original resolution, sharpening details and enhancing local contrast.
-b)	Network Structure: U-Net (adopting a feature fusion architecture).
-c)	Input Flow:
-i.	Encoder: Receives the original resolution 16-bit linear RGB image as input, progressively extracting features through a series of downsampling operations (e.g., Conv-Pool) down to the 1/8 resolution bottleneck layer.
-ii.	Feature Fusion: At the 1/8 resolution bottleneck, the feature maps from the encoder are concatenated with the output results from Stage 1 (the 1/8 resolution 8-bit RGB image).
-iii.	Decoder: Receives the concatenated fusion features and progressively restores the image to the original resolution through a series of upsampling operations and skip connections.
-d)	Output: The final 8-bit sRGB image (at original resolution).
-e)	GT (Ground Truth): 8-bit sRGB image (at original resolution, processed by the default iPhone Tone Mapping).
-3.	Training Loss.
-a)	Stage 1 Loss: L1 Loss (Mean Absolute Error): Calculates the L1 distance between the Stage 1 output (1/8 res) and the 8-bit GT (1/8 res).
-b)	Stage 2 Loss: L1 Loss: Calculates the L1 distance between the final Stage 2 output (original res) and the 8-bit GT (original res).
-L1 loss is less sensitive to outliers compared to L2 loss and tends to produce sharper image edges, making it suitable for image restoration and translation tasks.
-2.9.6	Experiment Results
-1.	Training scheme:
-Our model implementation is based on the model described in 2.10.5. It is implemented on Pytorch platform.  The training dataset is described in section 2.10.4 and the optimize algorithm is Adams, the learning rate is 0.0001. the training epochs is about 5000. The training stage uses self-collected data, and the training loss function is L1 loss.
-Training file:  "/Dataset/DB2/”
-Training code: "/data/ToneMapping/”
-Test data:” /test_images/”
-2.	Performance:
-	Quantitative Metric: 
-	Achieved a PSNR of 21.47 on the iPhone test dataset, serving as an objective measure of image quality and fidelity relative to the original source.
-	Qualitative Effects
-	Brightness & Detail Handling: Achieves simultaneous brightness adaptation and detail preservation across diverse lighting conditions, ensuring clarity in varied scenarios.
-	Foreground Subject Optimization: Employs luminance-optimized processing specifically for foreground subjects, making them more prominent and clear within the frame.
-	Skin Tone Reproduction: Capable of reproducing natural-looking skin tones.
- 
-2.9.7	Limitation
-The current method have problem in the following scenarios, as shown in figure.
-1.	Complex Color Correction: Handling images captured under colored or non-white light sources.
-2.	Accurate Small-Region Processing: Ensuring accurate skin tone reproduction even on small subjects. 
-3.	Robust Foreground-Background Separation: The need for strong enhancement of a foreground subject, potentially requiring aggressive tone mapping.
- 
-2.10	AI AE  （于晓璇）
+2.9.3 Challenges
+
+1 Exposure variation across scenes and sensors
+
+The network must accommodate changes in input exposure without making the output excessively bright, dark, flat, or gray. Exposure compensation must support tone mapping without being treated as a complete correction for sensor-dependent color response, noise, or upstream ISP differences.
+
+2 Shadow and highlight balance
+
+Backlit subjects and bright backgrounds require different local adjustments. Raising overall brightness can weaken highlight gradation, while strong highlight compression can leave faces and other dark subjects insufficiently visible. The network must coordinate these competing requirements within the same image.
+
+3 Detail and color preservation
+
+Enhancement should preserve skin texture, cloud structure, and fine edges while avoiding halos, amplified noise, color shifts, and excessive smoothing. Small faces and colored illumination are particularly demanding because their local appearance can be poorly represented at low resolution.
+
+4 Processing speed
+
+The deployment target is below 100 ms for a 3000 x 4000 image on the target Qualcomm GPU, including all Stage 1 and Stage 2 processing.
+
+2.9.4 Dataset Setup
+
+Training uses in-house paired data, generated targets for the target sensor, and auxiliary data for detail enhancement.
+
+1 In-house paired data
+
+The in-house dataset pairs linear RGB images derived from iPhone ProRAW captures with the corresponding camera-rendered images of the same scenes.
+
+Input: 16-bit linear RGB images derived from ProRAW captures.
+
+Target: 8-bit sRGB images prepared from the corresponding camera-rendered JPG or HEIC files through consistent decoding and color conversion.
+
+Stage 1 supervision: input-target pairs downsampled to one-eighth of the original width and height.
+
+Stage 2 supervision: full-resolution pairs for the final linear-RGB-to-sRGB mapping.
+
+Pixel-level supervision requires spatial correspondence between each input and target.
+
+2 Generated targets for the target sensor
+
+Sensor adaptation samples pair linear RGB inputs from the target sensor with enhanced sRGB targets produced offline by a large generative image model. The data construction draws on GGT-100K, which generates high-quality restoration targets from real-world images [3]. For tone mapping, the intended enhancements concern brightness, contrast, and color appearance while preserving scene content.
+
+Before inclusion in pixel-level training, generated targets must be checked for alignment, scene-content consistency, suitable shadow and highlight rendering, and visible artifacts. Samples with altered geometry, invented structures, or incompatible texture should be excluded from direct pixel-level supervision. Generated targets are pseudo-ground truth, and their provenance should remain distinguishable from that of the original paired targets.
+
+The generative model is used only for offline data preparation. Inference uses the two-stage tone mapping network.
+
+3 Auxiliary detail augmentation
+
+Blur, noise, and related degradations are applied to in-house sRGB targets to form degraded-sRGB-to-original-sRGB pairs for auxiliary detail enhancement. Because these pairs are constructed in the sRGB domain, their use in Stage 2 training must account for the difference from the main linear RGB input domain. The main paired data supervise the final linear-RGB-to-sRGB mapping.
+
+2.9.5 Solution Design
+
+The cascaded network uses Stage 1 to establish tone and color guidance at low resolution and Stage 2 to refine local contrast and detail at full resolution. Global adaptive exposure compensation operates within Stage 1. Stage 2 receives the full-resolution linear RGB input and fuses its encoder features with the Stage 1 output.
+
+1 Stage 1 Global adaptive exposure compensation and tone mapping
+
+Stage 1 receives the linear RGB input at one-eighth of the original width and height. An image-dependent global compensation component adjusts image-level brightness to reduce sensitivity to input exposure variations. The compensation operates on the captured image and does not alter sensor exposure settings.
+
+A U-Net [4] performs the low-resolution mapping into the target tonal domain, including dynamic range compression and color adjustment. The compensation component provides an image-level adjustment, while the U-Net predicts an RGB image with spatially varying tone information.
+
+The Stage 1 output is supervised by the downsampled target and passed to Stage 2 at one-eighth resolution. The 8-bit target format describes the supervision and delivery images, rather than the precision of intermediate network tensors.
+
+2 Stage 2 Local contrast and detail enhancement
+
+Stage 2 uses a U-Net encoder-decoder with skip connections [4] to refine local contrast and preserve fine detail. Its encoder receives the full-resolution linear RGB input and progressively extracts features through downsampling. At the one-eighth-resolution bottleneck, these features are concatenated with the low-resolution RGB output of Stage 1. The decoder reconstructs the full-resolution sRGB output from the fused features and skip connections.
+
+This arrangement provides Stage 2 with tone guidance from Stage 1 and image features from the full-resolution linear RGB input. Full-resolution target images supervise the final output.
+
+3 Training supervision
+
+Both stages use L1 reconstruction loss, a pixelwise objective studied in neural image restoration [5]. Stage 1 compares its prediction with the downsampled target, and Stage 2 compares the final prediction with the full-resolution target. In-house samples use paired camera-rendered targets; target-sensor adaptation samples use accepted generated targets.
+
+Reconstruction error against generated targets measures agreement with the selected appearance supervision. It does not independently establish fidelity to a captured ground-truth reference or perceptual quality.
+
+2.9.6 Experiment Results
+
+1 Current qualitative assessment
+
+Current qualitative results are generally satisfactory overall. The main unresolved issue occurs in challenging HDR scenes: dark subjects and shadow regions are not always enhanced sufficiently while maintaining natural highlight gradation. These observations describe overall rendering and do not isolate the contribution of either exposure compensation or generated training targets.
+
+2 Validation priorities
+
+Validation should use held-out captures to assess overall appearance and region-level shadow visibility, highlight gradation, skin rendering, and artifacts. Ablation tests should evaluate the contributions of generated training targets and exposure compensation under the same evaluation conditions. Latency must be measured at the target resolution on the target GPU to establish whether the network meets the deployment budget.
+
+2.9.7 Limitations
+
+1 Spatially competing tone requirements
+
+Global compensation provides an image-level adjustment, but a bright background and a dark foreground can require different changes. Resolving that conflict depends on the spatial tone mapping and local refinement stages. The current HDR shadow-highlight imbalance shows that this remains an open limitation.
+
+2 Information lost before tone mapping
+
+Exposure compensation cannot restore scene detail lost through sensor saturation or upstream clipping. Raising dark regions also cannot remove the uncertainty caused by low signal-to-noise ratio. Improvements must be assessed against the information actually present in the input.
+
+3 Complex illumination and small subjects
+
+Color under non-white illumination, skin on small faces, and foreground-background contrast require continued validation. Low-resolution tone guidance may not adequately represent these regions, increasing the demands on Stage 2.
+
+4 Reliability of generated supervision
+
+Generated targets can introduce content changes, artificial texture, or inconsistent tonal preferences. Such errors can become training bias even when reconstruction loss is low. Filtering unsuitable targets and validating on independent captures are necessary to assess whether adaptation improves the intended rendering.
+
+References
+
+[1] Erik Reinhard, Michael Stark, Peter Shirley, and James Ferwerda. Photographic Tone Reproduction for Digital Images. ACM Transactions on Graphics, 21(3):267-276, 2002. https://doi.org/10.1145/566654.566575
+
+[2] Michaël Gharbi, Jiawen Chen, Jonathan T. Barron, Samuel W. Hasinoff, and Frédo Durand. Deep Bilateral Learning for Real-Time Image Enhancement. ACM Transactions on Graphics, 36(4), Article 118, 2017. https://doi.org/10.1145/3072959.3073592
+
+[3] Xiangtao Kong, Jixin Zhao, Lingchen Sun, Rongyuan Wu, and Lei Zhang. GGT-100K: Generative Ground Truth for Generalizable Real-World Image Restoration. arXiv:2605.31039, 2026. https://arxiv.org/abs/2605.31039
+
+[4] Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-Net: Convolutional Networks for Biomedical Image Segmentation. MICCAI, LNCS 9351:234-241, 2015. https://doi.org/10.1007/978-3-319-24574-4_28
+
+[5] Hang Zhao, Orazio Gallo, Iuri Frosio, and Jan Kautz. Loss Functions for Image Restoration with Neural Networks. IEEE Transactions on Computational Imaging, 3(1):47-57, 2017. https://doi.org/10.1109/TCI.2016.2644865
