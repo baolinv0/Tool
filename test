@@ -1,41 +1,172 @@
-### 2.8.6 Experimental Results
+## 一、核心结论：新方案是在旧方案基础上的系统升级，而不是两个相互独立的方案
 
-We evaluated the proposed method through three complementary comparisons: matching the target reference, comparing results with flagship cameras, and testing additional real-world captures without paired references.
+通过 GitHub 提交历史核对：
 
-**1. Target Reference Matching**
+- 旧方案（10月26日）：[reference-retouch-contract-20261026](https://github.com/baolinv0/HarnessIR/tree/codex/reference-retouch-contract-20261026?utm_source=chatgpt.com)
+- 新方案（11月1日）：[reference-unified-20261101](https://github.com/baolinv0/HarnessIR/tree/codex/reference-unified-20261101?utm_source=chatgpt.com)
 
-Figure 1 compares results from six indoor scenes featuring portraits, warm or mixed lighting, bright backgrounds, and dim interiors. Each row shows the original 16-bit linear RGB input without tone mapping, the output of the model trained on iPhone-paired data, our enhanced result, the S26 camera output, and the iPhone reference.
+新分支直接继承旧分支，领先 3 个提交，没有分叉冲突。旧方案的核心代码被保留，新方案新增 Reference Style 证据体系、统一契约、全图评测、实验对照和审查机制。
 
-Our method improves the visibility of both subjects and backgrounds, with overall brightness, color, and facial detail broadly comparable to the reference. Compared with the baseline and S26 outputs, the enhanced results show more natural-looking skin tones and better-balanced local contrast. The differences are less noticeable under even lighting. Scenes with strong brightness differences or mixed illumination remain challenging, with insufficient shadow enhancement or residual color casts in some cases.
+两者的定位可以概括为：
 
-**2. Comparison with Flagship Cameras**
+旧方案：解决 Reference Retouch 如何正确执行、约束修改并交付结果。
 
-Figure 2 compares our method with the iPhone 17 Pro Max, Huawei Pura 90, vivo X300U, and S26U in an extreme low-light group portrait under strong colored lighting. Results from the June 2026 milestone build and the current build are also included.
+新方案：进一步解决如何根据 A/B 图像证据制定合理的编辑目标、判断结果是否真正更接近 B，以及如何通过实验验证整个系统的收益。
 
-The current build makes foreground subjects clearly visible while preserving facial detail and background structure. Skin tones appear relatively natural, but subject brightness remains moderate. Compared with the iPhone and Huawei outputs, the subjects stand out less from the background, giving the image a somewhat flat appearance. This indicates a need for stronger subject separation through local tone and contrast adjustment.
+因此，新方案更接近完整的 Reference-guided Image Editing / Retouching 研究与工程框架，但模块增加不等于模型编辑能力已经提高。
 
-**3. Real-World Evaluation without Paired References**
+## 二、功能与架构差异
 
-Figure 3 compares the baseline with the model fine-tuned using regenerated training targets on two additional real-world scenes: a portrait against bright signage and a group portrait under strong colored lighting.
+| 对比维度  | 旧方案：10/26           | 新方案：11/01               |
+| ----- | ------------------- | ----------------------- |
+| 核心目标  | 参考外观编辑与交付闭环         | 统一证据、执行、评测与实验           |
+| 参考理解  | A/B 分别分析，八维覆盖       | 保留八维，增加独立证据审计与诊断复核      |
+| 区域建模  | A/B 对应区域、属性级可比性     | 增强整脸、整个物体、材质区域的关系约束     |
+| 目标生成  | 冻结目标、逐项验收           | 增加最终执行条件的语义一致性审计        |
+| 编辑器   | GPT Image 工作台及四模型接口 | 继承原执行器，增加统一接入与版本路由      |
+| 结果评价  | 逐目标、内容保护、伪影及交付检查    | 先全图风格，再区域验证，最后使用数值解释    |
+| 反馈机制  | 有限 Prompt 修订        | 统一反馈记录、冲突处理、同候选复核       |
+| 图像交付  | 原生尺寸、细节验收           | 更严格的预检、文件绑定和原生细节证据      |
+| 实验系统  | 已有案例实验及待实现的完整计划     | 六臂 Study、盲评、评分冲突裁决、统一报告 |
+| 当前成熟度 | v1 软件实现 + v2 工程计划   | v2 软件实现及测试，真实质量实验尚未执行   |
 
-Both models produce clearly visible images from linear inputs that appear nearly black without tone mapping. Compared with the baseline, the fine-tuned model preserves more visible detail in bright areas and produces more natural-looking skin tones and a better-balanced brightness distribution, while maintaining similar shadow visibility. These examples suggest that regenerated training targets can improve rendering on additional real-world captures.
+### 1. Pipeline：最明显的技术变化
 
-Together, the three comparisons show that the method can approach the target rendering, maintain useful detail in challenging scenes, and benefit from regenerated training targets. However, the findings are qualitative. Cross-device differences in acquisition and processing, together with the limited test set, prevent broader conclusions about generalization or the contribution of individual network components.
+旧方案：Reference Retouch v1
 
-### 2.8.7 Limitations
+输入 A（源图）+ B（参考图）
 
-**1. Shadow–Highlight Balance and Subject Separation**
+诊断 → 证据 → 目标冻结
 
-Balancing shadow enhancement with highlight preservation remains difficult in high-contrast scenes. Under extreme low light, foreground subjects are visible but do not stand out as strongly as in some flagship camera outputs, resulting in relatively flat rendering.
+Prompt 编译 → 图像编辑
 
-**2. Evaluation and Generated-Target Reliability**
+逐目标验证 → 反馈 / 交付
 
-The current evaluation is based on a limited number of qualitative comparisons. Additional testing is needed to assess generalization and isolate the contribution of individual components. Regenerated training targets may also introduce unwanted changes in image content, texture, or color, making careful selection and validation important.
+新方案：Reference Unified v2
 
-### 2.8.8 Conclusion and Future Work
+输入审计 A/B + 独立 Reference Style 证据链
 
-The proposed two-stage tone mapping network converts high-bit-depth linear RGB inputs into display-ready sRGB images. Qualitative results show improved subject visibility and overall rendering broadly comparable to the target references. Fine-tuning with regenerated training targets also improves visible highlight detail, skin appearance, and brightness balance in the additional real-world examples.
+诊断 → 证据复核 → 有效诊断
 
-The main remaining challenges are balancing shadow and highlight rendering, improving foreground–background separation, and maintaining consistent color under mixed illumination.
+目标冻结 → 交付预检 → 最终指令语义审计
 
-Future work will focus on region-aware tone and contrast adjustment, particularly for faces, dark subjects, and bright backgrounds. We will also refine the selection of regenerated training targets to improve rendering consistency while preserving scene content. Evaluation will be expanded to held-out scenes, controlled ablation studies, and region-level measurements of brightness, color, and detail. Finally, runtime performance will be measured on the target hardware to assess deployment feasibility.
+图像编辑（沿用现有 Executor）
+
+全图六轴评价 → 区域/逐目标验证
+
+统一反馈 → 追加复核 / 交付 / 实验归档
+
+逻辑架构示意。新方案中 Reference Style 是独立证据入口，并非每次 `hre models` 运行都会自动调用的前置模型。
+
+这里新增的关键模块有三个。
+
+A. Evidence Review：证据不能只是收集，还必须影响诊断。
+
+旧实现可能出现初始诊断认为某区域需要变亮，随后测量发现 A/B 的亮度根本不可比，但流程仍沿旧诊断进入 Compose。
+
+新方案保存 `initial_diagnosis`，再生成独立的 `effective_diagnosis`。若新证据与初始判断冲突，必须显式解决，否则暂停。
+
+B. Semantic Audit：检查最终真正送给图像模型的条件。
+
+过去只验证目标合同正确，并不足以保证 Qwen 的 PE-I2I 或 FLUX 的 PUP 重写之后仍保留完整目标。
+
+新方案要求审计最终 Prompt 文本和原生编译输出，检查区域、可比性限制、保护项、目标覆盖等，且绑定实际执行条件的 hash。审计失败则阻止生成。
+
+C. Whole-Image Review：整体风格不再被局部数值覆盖。
+
+新方案增加六个全图观察维度：
+
+Tone 影调
+
+Color 色彩
+
+Brightness 亮度
+
+Lighting 光照自然度
+
+Material 材质关系
+
+Processing 处理痕迹
+
+每项记录方向、幅度、相对 B 的关系、置信度和证据，同时独立检查 A 的内容保留。只有之后才进入局部和逐目标验证。
+
+这针对一个真实的评测缺陷：局部肤色 Lab 或 ROI 亮度更接近 B，并不代表整张图像的影调风格更接近 B。
+
+对应实现见 [reference_core/holistic.py](https://github.com/baolinv0/HarnessIR/blob/codex/reference-unified-20261101/engine/src/hre/reference_core/holistic.py?utm_source=chatgpt.com) 与 [reference_retouch_v2.py](https://github.com/baolinv0/HarnessIR/blob/codex/reference-unified-20261101/engine/src/hre/v3/reference_retouch_v2.py?utm_source=chatgpt.com)。
+
+## 三、哪个方案在真正改善图像编辑能力？
+
+这是我认为需要特别区分的地方。
+
+新方案明显增强了系统可靠性和结果可审计性，但没有从根本上改变图像生成模型的区域控制能力。
+
+例如，假设 A 是正常肤色、背景偏暗的图像，B 是更温暖且背景更通透的参考。
+
+理想编辑应该是肤色保持自然，背景亮度提高，整图影调关系接近 B。
+
+旧方案可能把它转化为一组语义 Prompt；新方案能够更可靠地检查目标是否被正确表达、条件是否丢失，以及输出是否出现整体暖黄偏移。
+
+但两者最终依然依赖编辑器理解和执行这些描述。
+
+我检查了新代码中的 `unified_workflow.py` 和 `s3_handoff.py`：
+
+- 新增了整脸、完整物体、材质区域的语义约束。
+- Reference Style 可以提供带标注的区域辅助图，但明确将其视为定位信息，而非硬 Mask。
+- 没有看到新的执行器级强制区域锁定或分区像素融合机制。
+- 新工作台在缺少真实 C 区域支持时，会将对应区域测量标记为 unavailable，而非自动推断。
+
+因此，你此前发现的整图偏黄、模型不能精确按区域迁移风格的问题，新方案可以更好地发现和追踪，但不能据此认为已解决。
+
+这也是新方案当前最重要的能力边界。
+
+## 四、软件落地与实验状态
+
+旧方案 PR #11
+
+# 677
+
+Linux 完整测试通过数
+
+旧 v1 工程已有可运行实现
+
+新方案 PR #12
+
+# 905
+
+本地完整测试通过数
+
+另有 15 failed、3 skipped；远端 CI 成功
+
+新分支已经实现了主要软件增量，并完成两轮独立代码审查，第一轮提出的四个阻断问题已修复。两个 PR 均尚未合并。
+
+但要注意软件验证与模型效果的区别。
+
+软件链路、契约验证、回归测试：已有证据
+
+真实模型的参考风格迁移收益：尚未验证
+
+新分支在 11 月 2 日补充了 [完整实验计划](https://github.com/baolinv0/HarnessIR/blob/codex/reference-unified-20261101/docs/reference_unified/experiments/EXPERIMENT_PLAN.md?utm_source=chatgpt.com)。核心设计是固定后端，比较六条路径，包含 A-only、Direct A+B、历史 Shared/Model-Aware、新 Shared/Model-Aware 等。
+
+默认主实验为 60 组图像、六臂、三次重复，共 1080 个计划行；加上机制预检、双参考干预及反馈实验，核心预算上限为 1524 个图像提交槽。
+
+这份实验还没有运行。 所以目前不能证明 Unified 的编辑效果优于旧版，更不能证明它解决了局部风格迁移问题。
+
+## 五、我的判断与建议
+
+从你的 Reference Retouch 研究目标看，应该采用 新分支作为后续工程基线，但不建议立即投入完整六臂、1524 槽的实验。
+
+当前更关键的是区分三个研究问题：
+
+| 研究问题                      | 新方案进展       | 尚缺什么             |
+| ------------------------- | ----------- | ---------------- |
+| 能否正确理解 A/B 风格差异？          | 更严格的证据与诊断复核 | 诊断结果与独立人工判断的一致性  |
+| 能否把正确差异传递给 Executor？      | 最终条件语义审计已实现 | 审计结果与真实模型执行行为的关联 |
+| Executor 能否正确执行全图与语义区域调整？ | 全图和区域评价机制增强 | 真正的区域控制能力及质量改善证据 |
+
+我建议先在固定的 Qwen 编辑器上做一个小规模、有辨别力的对照：同样的 A/B、同样的生成预算，比较 Direct A+B、旧 v1 和新 v2，并且单独检查全图色偏、肤色与背景是否被分别调整。
+
+这项对照可以回答最关键的问题：新方案的收益究竟来自更正确的视觉决策、更可靠的 Prompt 传递，还是仅仅来自更严格的失败检测？
+
+如果结果是新方案更会发现错误，却不能让 Qwen 更准确地执行局部调整，那么下一阶段真正需要研究的就不是继续扩充合同和评测体系，而是 Reference-guided Regional Control，包括区域条件输入、Mask/Control 接口或可验证的分区渲染机制。
+
+整体而言，10/26 → 11/01 是一次有实质增量的工程升级；但从科研创新性看，当前增强主要集中在可审计、可复现的系统机制上，真正的参考风格迁移质量提升仍然是待证明的研究假设。
