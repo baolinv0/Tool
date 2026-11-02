@@ -1,129 +1,41 @@
-Tone Mapping Algorithm Design 2026
+### 2.8.6 Experimental Results
 
-The tone mapping method converts high-bit-depth linear RGB into display-ready sRGB through two stages. Stage 1 performs adaptive exposure compensation and tone mapping at low resolution. Stage 2 combines this tone guidance with full-resolution image features to refine local contrast and detail. Training uses paired camera data and generative-model-assisted targets for the target sensor. Qualitative assessment is generally satisfactory, while balancing shadow visibility with highlight gradation in challenging HDR scenes remains the main limitation.
+We evaluated the proposed method through three complementary comparisons: matching the target reference, comparing results with flagship cameras, and testing additional real-world captures without paired references.
 
-2.9.1 Background
+**1. Target Reference Matching**
 
-In a mobile image signal processor (ISP), tone mapping converts high-bit-depth linear RGB into an sRGB image for standard dynamic range display. It compresses the captured luminance range while preserving natural appearance and visible detail, addressing the tone reproduction problem studied in photographic rendering [1].
+Figure 1 compares results from six indoor scenes featuring portraits, warm or mixed lighting, bright backgrounds, and dim interiors. Each row shows the original 16-bit linear RGB input without tone mapping, the output of the model trained on iPhone-paired data, our enhanced result, the S26 camera output, and the iPhone reference.
 
-Sensor-specific tone mapping requires attention to both input exposure and target appearance. Sensor response and upstream automatic exposure (AE) and ISP processing affect the linear RGB distribution, while training targets determine the brightness, contrast, and color that the network learns to reproduce. The method addresses these factors through exposure compensation in the low-resolution stage and training supervision matched to the target sensor.
+Our method improves the visibility of both subjects and backgrounds, with overall brightness, color, and facial detail broadly comparable to the reference. Compared with the baseline and S26 outputs, the enhanced results show more natural-looking skin tones and better-balanced local contrast. The differences are less noticeable under even lighting. Scenes with strong brightness differences or mixed illumination remain challenging, with insufficient shadow enhancement or residual color casts in some cases.
 
-Efficient learned enhancement methods such as HDRNet combine low-resolution prediction with full-resolution image processing [2]. The architecture described here uses low-resolution RGB tone guidance and a full-resolution refinement network.
+**2. Comparison with Flagship Cameras**
 
-2.9.2 Purpose
+Figure 2 compares our method with the iPhone 17 Pro Max, Huawei Pura 90, vivo X300U, and S26U in an extreme low-light group portrait under strong colored lighting. Results from the June 2026 milestone build and the current build are also included.
 
-The objective is to produce display-ready sRGB images with natural overall brightness, consistent color, and visible local detail across normally exposed, backlit, and low-light scenes. Subject brightness should remain appropriate relative to the background, and shadow enhancement should preserve highlight gradation.
+The current build makes foreground subjects clearly visible while preserving facial detail and background structure. Skin tones appear relatively natural, but subject brightness remains moderate. Compared with the iPhone and Huawei outputs, the subjects stand out less from the background, giving the image a somewhat flat appearance. This indicates a need for stronger subject separation through local tone and contrast adjustment.
 
-Stage 1 handles adaptive exposure compensation and low-resolution brightness and color mapping. Stage 2 refines local contrast and detail at full resolution. Generated training targets provide appearance supervision under the target sensor's imaging conditions.
+**3. Real-World Evaluation without Paired References**
 
-2.9.3 Challenges
+Figure 3 compares the baseline with the model fine-tuned using regenerated training targets on two additional real-world scenes: a portrait against bright signage and a group portrait under strong colored lighting.
 
-1 Exposure variation across scenes and sensors
+Both models produce clearly visible images from linear inputs that appear nearly black without tone mapping. Compared with the baseline, the fine-tuned model preserves more visible detail in bright areas and produces more natural-looking skin tones and a better-balanced brightness distribution, while maintaining similar shadow visibility. These examples suggest that regenerated training targets can improve rendering on additional real-world captures.
 
-The network must accommodate changes in input exposure without making the output excessively bright, dark, flat, or gray. Exposure compensation must support tone mapping without being treated as a complete correction for sensor-dependent color response, noise, or upstream ISP differences.
+Together, the three comparisons show that the method can approach the target rendering, maintain useful detail in challenging scenes, and benefit from regenerated training targets. However, the findings are qualitative. Cross-device differences in acquisition and processing, together with the limited test set, prevent broader conclusions about generalization or the contribution of individual network components.
 
-2 Shadow and highlight balance
+### 2.8.7 Limitations
 
-Backlit subjects and bright backgrounds require different local adjustments. Raising overall brightness can weaken highlight gradation, while strong highlight compression can leave faces and other dark subjects insufficiently visible. The network must coordinate these competing requirements within the same image.
+**1. Shadow–Highlight Balance and Subject Separation**
 
-3 Detail and color preservation
+Balancing shadow enhancement with highlight preservation remains difficult in high-contrast scenes. Under extreme low light, foreground subjects are visible but do not stand out as strongly as in some flagship camera outputs, resulting in relatively flat rendering.
 
-Enhancement should preserve skin texture, cloud structure, and fine edges while avoiding halos, amplified noise, color shifts, and excessive smoothing. Small faces and colored illumination are particularly demanding because their local appearance can be poorly represented at low resolution.
+**2. Evaluation and Generated-Target Reliability**
 
-4 Processing speed
+The current evaluation is based on a limited number of qualitative comparisons. Additional testing is needed to assess generalization and isolate the contribution of individual components. Regenerated training targets may also introduce unwanted changes in image content, texture, or color, making careful selection and validation important.
 
-The deployment target is below 100 ms for a 3000 x 4000 image on the target Qualcomm GPU, including all Stage 1 and Stage 2 processing.
+### 2.8.8 Conclusion and Future Work
 
-2.9.4 Dataset Setup
+The proposed two-stage tone mapping network converts high-bit-depth linear RGB inputs into display-ready sRGB images. Qualitative results show improved subject visibility and overall rendering broadly comparable to the target references. Fine-tuning with regenerated training targets also improves visible highlight detail, skin appearance, and brightness balance in the additional real-world examples.
 
-Training uses in-house paired data, generated targets for the target sensor, and auxiliary data for detail enhancement.
+The main remaining challenges are balancing shadow and highlight rendering, improving foreground–background separation, and maintaining consistent color under mixed illumination.
 
-1 In-house paired data
-
-The in-house dataset pairs linear RGB images derived from iPhone ProRAW captures with the corresponding camera-rendered images of the same scenes.
-
-Input: 16-bit linear RGB images derived from ProRAW captures.
-
-Target: 8-bit sRGB images prepared from the corresponding camera-rendered JPG or HEIC files through consistent decoding and color conversion.
-
-Stage 1 supervision: input-target pairs downsampled to one-eighth of the original width and height.
-
-Stage 2 supervision: full-resolution pairs for the final linear-RGB-to-sRGB mapping.
-
-Pixel-level supervision requires spatial correspondence between each input and target.
-
-2 Generated targets for the target sensor
-
-Sensor adaptation samples pair linear RGB inputs from the target sensor with enhanced sRGB targets produced offline by a large generative image model. The data construction draws on GGT-100K, which generates high-quality restoration targets from real-world images [3]. For tone mapping, the intended enhancements concern brightness, contrast, and color appearance while preserving scene content.
-
-Before inclusion in pixel-level training, generated targets must be checked for alignment, scene-content consistency, suitable shadow and highlight rendering, and visible artifacts. Samples with altered geometry, invented structures, or incompatible texture should be excluded from direct pixel-level supervision. Generated targets are pseudo-ground truth, and their provenance should remain distinguishable from that of the original paired targets.
-
-The generative model is used only for offline data preparation. Inference uses the two-stage tone mapping network.
-
-3 Auxiliary detail augmentation
-
-Blur, noise, and related degradations are applied to in-house sRGB targets to form degraded-sRGB-to-original-sRGB pairs for auxiliary detail enhancement. Because these pairs are constructed in the sRGB domain, their use in Stage 2 training must account for the difference from the main linear RGB input domain. The main paired data supervise the final linear-RGB-to-sRGB mapping.
-
-2.9.5 Solution Design
-
-The cascaded network uses Stage 1 to establish tone and color guidance at low resolution and Stage 2 to refine local contrast and detail at full resolution. Global adaptive exposure compensation operates within Stage 1. Stage 2 receives the full-resolution linear RGB input and fuses its encoder features with the Stage 1 output.
-
-1 Stage 1 Global adaptive exposure compensation and tone mapping
-
-Stage 1 receives the linear RGB input at one-eighth of the original width and height. An image-dependent global compensation component adjusts image-level brightness to reduce sensitivity to input exposure variations. The compensation operates on the captured image and does not alter sensor exposure settings.
-
-A U-Net [4] performs the low-resolution mapping into the target tonal domain, including dynamic range compression and color adjustment. The compensation component provides an image-level adjustment, while the U-Net predicts an RGB image with spatially varying tone information.
-
-The Stage 1 output is supervised by the downsampled target and passed to Stage 2 at one-eighth resolution. The 8-bit target format describes the supervision and delivery images, rather than the precision of intermediate network tensors.
-
-2 Stage 2 Local contrast and detail enhancement
-
-Stage 2 uses a U-Net encoder-decoder with skip connections [4] to refine local contrast and preserve fine detail. Its encoder receives the full-resolution linear RGB input and progressively extracts features through downsampling. At the one-eighth-resolution bottleneck, these features are concatenated with the low-resolution RGB output of Stage 1. The decoder reconstructs the full-resolution sRGB output from the fused features and skip connections.
-
-This arrangement provides Stage 2 with tone guidance from Stage 1 and image features from the full-resolution linear RGB input. Full-resolution target images supervise the final output.
-
-3 Training supervision
-
-Both stages use L1 reconstruction loss, a pixelwise objective studied in neural image restoration [5]. Stage 1 compares its prediction with the downsampled target, and Stage 2 compares the final prediction with the full-resolution target. In-house samples use paired camera-rendered targets; target-sensor adaptation samples use accepted generated targets.
-
-Reconstruction error against generated targets measures agreement with the selected appearance supervision. It does not independently establish fidelity to a captured ground-truth reference or perceptual quality.
-
-2.9.6 Experiment Results
-
-1 Current qualitative assessment
-
-Current qualitative results are generally satisfactory overall. The main unresolved issue occurs in challenging HDR scenes: dark subjects and shadow regions are not always enhanced sufficiently while maintaining natural highlight gradation. These observations describe overall rendering and do not isolate the contribution of either exposure compensation or generated training targets.
-
-2 Validation priorities
-
-Validation should use held-out captures to assess overall appearance and region-level shadow visibility, highlight gradation, skin rendering, and artifacts. Ablation tests should evaluate the contributions of generated training targets and exposure compensation under the same evaluation conditions. Latency must be measured at the target resolution on the target GPU to establish whether the network meets the deployment budget.
-
-2.9.7 Limitations
-
-1 Spatially competing tone requirements
-
-Global compensation provides an image-level adjustment, but a bright background and a dark foreground can require different changes. Resolving that conflict depends on the spatial tone mapping and local refinement stages. The current HDR shadow-highlight imbalance shows that this remains an open limitation.
-
-2 Information lost before tone mapping
-
-Exposure compensation cannot restore scene detail lost through sensor saturation or upstream clipping. Raising dark regions also cannot remove the uncertainty caused by low signal-to-noise ratio. Improvements must be assessed against the information actually present in the input.
-
-3 Complex illumination and small subjects
-
-Color under non-white illumination, skin on small faces, and foreground-background contrast require continued validation. Low-resolution tone guidance may not adequately represent these regions, increasing the demands on Stage 2.
-
-4 Reliability of generated supervision
-
-Generated targets can introduce content changes, artificial texture, or inconsistent tonal preferences. Such errors can become training bias even when reconstruction loss is low. Filtering unsuitable targets and validating on independent captures are necessary to assess whether adaptation improves the intended rendering.
-
-References
-
-[1] Erik Reinhard, Michael Stark, Peter Shirley, and James Ferwerda. Photographic Tone Reproduction for Digital Images. ACM Transactions on Graphics, 21(3):267-276, 2002. https://doi.org/10.1145/566654.566575
-
-[2] Michaël Gharbi, Jiawen Chen, Jonathan T. Barron, Samuel W. Hasinoff, and Frédo Durand. Deep Bilateral Learning for Real-Time Image Enhancement. ACM Transactions on Graphics, 36(4), Article 118, 2017. https://doi.org/10.1145/3072959.3073592
-
-[3] Xiangtao Kong, Jixin Zhao, Lingchen Sun, Rongyuan Wu, and Lei Zhang. GGT-100K: Generative Ground Truth for Generalizable Real-World Image Restoration. arXiv:2605.31039, 2026. https://arxiv.org/abs/2605.31039
-
-[4] Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-Net: Convolutional Networks for Biomedical Image Segmentation. MICCAI, LNCS 9351:234-241, 2015. https://doi.org/10.1007/978-3-319-24574-4_28
-
-[5] Hang Zhao, Orazio Gallo, Iuri Frosio, and Jan Kautz. Loss Functions for Image Restoration with Neural Networks. IEEE Transactions on Computational Imaging, 3(1):47-57, 2017. https://doi.org/10.1109/TCI.2016.2644865
+Future work will focus on region-aware tone and contrast adjustment, particularly for faces, dark subjects, and bright backgrounds. We will also refine the selection of regenerated training targets to improve rendering consistency while preserving scene content. Evaluation will be expanded to held-out scenes, controlled ablation studies, and region-level measurements of brightness, color, and detail. Finally, runtime performance will be measured on the target hardware to assess deployment feasibility.
