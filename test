@@ -1,99 +1,26 @@
-# 批次 C：限额修复回路（Bounded Validation-Feedback Repair）设计
+证据全部提取完毕。先把结论说精确：**"扩大上下文"本身是可以的**（E3 实证 True 跑完了）——真正不行的组合和证据链如下：
 
-**协议**：`qwen-reference-3arm-pilot-v1` 增补臂 **A5**
-**日期**：2026-11-03
-**状态**：**DESIGN_APPROVED / NOT_IMPLEMENTED / NOT_FROZEN**（未实现、未运行、不是结果报告）
-**依据**：A4 资格验证批（8 例，1 ready / 7 failed，产物在 `data/new_binary/focused_3arm_20261102/`）；`1103_revise/2026-11-03-reference-stage-decisions.md` 第 75 行预留；用户 2026-11-03 两次设计决策（全量反馈方案；新臂 A5 独立口径）
+## 四次受控实验（同一 36k-token 全载荷、temperature=0、同一 8002）
 
----
+| # | 服务器上下文 | max_tokens | thinking | finish | completion | content | 结果 |
+|---|---|---|---|---|---|---|---|
+| E0 | 40960 | 8192 | on（默认） | **length** | 4,937 | `None` | 💥 agent.py 崩 |
+| E0b | 65536 | 12288 | on | **length** | 12,288 | 空 | 💥 仍会崩 |
+| E2 | 65536 | 4096 | **false** | stop | **480** | 1,281 字符 | ✅ 合法 policy |
+| E3 | 65536 | 28000 | **true** | stop | **15,556** | 1,406 字符 | ⚠️ `no_legal_action` |
 
-## 0. 证据基础与失败分类（经产物逐案核实，含一处归因修正）
+（E2/E3 证据：`verification/qwen_probe_thinking_{false,true}.json` 含原始 message/usage，可重放）
 
-A4 批 8 例（`{G01,G03,G08,G09} × {V1,V2}`，spec 声明 `stage_adapter=reference_decisions_v1`，stage 端点=迷你服务 8001/Qwen3.8-27B thinking）。逐案终端错误与归档 `decision_payload` 对冻结 schema 全量校验后，真实失败分类为两族：
+## 为什么 True 在常规预算下"不行"——三层证据
 
-| 族 | 案例 | 实际机制 | A4 快报原归类 | 修正 |
-|---|---|---|---|---|
-| **R1 契约类：整包坍缩 / schema 回显** | G01_A4_V2（evidence_review）、G03_A4_V1/V2、G09_A4_V1/V2（diagnose） | 模型把整个响应坍缩成**单条 finding 对象**（五字段齐全但缺全部 7 个顶级键），或**把 schema 片段 `{type,uniqueItems,items}` 当实例输出** | "findings 条目缺 confidence/evidence_refs"、"tool_requests 写成 schema 片段" | 条目级字段并不缺；失败发生在**顶级文档结构**，非条目内部 |
-| **R2 弃权类：占位符弃权** | G08_A4_V1/V2（diagnose） | 返回 `{"error":{"code":"image_not_observed","message":"reason"}}`——message 是**模板字面占位符** `"reason"`（思考 8367 token / 402s 后输出），疑似照抄指示中的信封示例而非真实未观察 | "模型弃权 image_not_observed" | 存在伪弃权证据，但不能先验排除真弃权；由修复结果实证 |
+1. **reasoning 消耗无界**：E0 里 `total=40960` 分毫不差顶满上下文（36023 prompt + 4937 completion），reasoning 16,796 字符被截断；E0b 加到 12288，reasoning 涨到 38,278 字符**仍未完**。它在逐条咀嚼 80 条 observations + 8260 条 failure 统计，预算给多少吃多少。
+2. **崩溃机制是代码级的**：预算耗尽 → `message.content=None` → `agent.py` L45 `text.startswith()` 抛 `AttributeError`，而 L66 的 except 只接 `(ValueError, KeyError, OSError)` → **非受控崩溃，连重试都不进**。这与上下文大小无关——默认 max_tokens=2048 时 65k 上下文照样必崩。
+3. **E3 证明扩上下文能完赛但有代价**：
+   - **25× 墙钟**（627.7s vs 25.6s）、32× completion（15,556 vs 480）
+   - **答案退化**：True 产出 `no_legal_action`——理由"local_exposure = x·2^(−ev) ≤ 1 只能变暗，修不了 under-recovery 主失败（1225 例）"。逻辑自洽，但与 p03 实测（变暗合成 28.3035 > baseline 28.2322）相悖。按契约这是合法结果，但意味着 M3.qwen 臂将永远拒绝提案、实质缺勤。
 
-唯一全过案例 G01_A4_V1（ready/condition）证明适配器组装+校验链路本身正确；失败按图像组聚类（G08 双弃权、G03/G09 双坍缩）说明驱动变量是图像内容难度下的模型行为分化，不是臂/协议差异。
+## 修正后的精确结论
 
-## 1. 目标与非目标
-
-**目标**：以协议预留的限额修复回路重跑 7 例失败案例（新臂 A5），测量"一次性契约 + 一次具体校验反馈"下的资格通过率；全部尝试留痕入账；结果单列，不与 A4 一次性口径合并。
-
-**非目标**：不改视觉目标/brief/冻结模板任何字节；不重新运行已成功阶段（含 G01_A4_V1 全链）；不引入多轮对话、训练、重采样成功结果；不向模型透露正确答案或图像内容；不以修复后通过率替代一次性通过率作资格结论。
-
-## 2. 机制设计
-
-### 2.1 冻结声明（contracts.py + 新 spec）
-
-新可选任务字段，创建时校验（类型/上下界/仅允许与 `stage_adapter` 同现），随任务 hash-bound：
-
-```json
-"stage_repair": {"mode": "validation_feedback_v1",
-                 "max_repairs_per_stage": 1,
-                 "max_extra_calls_per_case": 2,
-                 "abstention_feedback": true}
-```
-
-冻结任务不可变 → A5 全部为**新 case_id**（`G0x_A5_V1/V2`），manifest 升 rev13，SPEC_LEDGER 标 `repair-assisted`。
-
-### 2.2 违规清单生成器（新模块 `v3/repair_feedback.py`）
-
-输入：冻结 `response_schema` 的**非错误分支** + 模型原始输出（文本/已解析对象）+ 校验异常；输出：确定性紧凑违规清单（同输入必同输出），只含规则定位：缺失顶级键、多余键、逐路径 required/enum/范围/类型违规。**硬规则：不含正确取值、不含视觉内容**（result_schema 本就在提示中，反馈零新增答案信息）。
-
-R1 反馈骨架：「上一次输出未通过校验。违规清单：1) 缺失顶级键：findings, dimensions, …；2) 顶级出现不属于决策文档的键：…。输出必须是满足 result_schema 的完整决策对象，或 error 信封。」
-
-R2（弃权变体，`abstention_feedback=true` 时启用）反馈骨架：「传输事实：本请求附带 N 张图像（角色 source / appearance_reference），字节级 sha256 已校验通过。若返回 error 信封，message 必须描述具体的观察尝试与失败原因，不得使用占位文本。」——只陈述**传输事实**，不描述图像内容；模型再次弃权且理由具体 → 接受失败终态。
-
-### 2.3 run_stage 微调（stages.py）
-
-识别可选 `request["repair_feedback"]`（字符串列表）：存在时在用户消息尾部追加反馈段；图像照常重附并逐字节重校验（`input_modified` 照旧拦截）。**冻结 `stage_template` 不变**（`stage_template_changed` 不受影响，A4/A5 模板 digest 一致由回归测试钉死）。每次修复调用是**全新单轮请求**（不挂多轮对话史），每 attempt 仍恰好一次 VLM 调用——文档不变量成立。
-
-### 2.4 runner 修复分支（runner.py）
-
-`stage_error` 到达时：若错误类属可修复集且两级预算均未尽 → 由 2.2 生成反馈、建下一 attempt（既有 `operation_attempts`/`-a%03d` op 目录）、正常计费、归档反馈文本；否则按现行终态落账。
-
-- **可修复集**：`stage_payload_invalid`（含 schema 校验、契约校验、重复键 JSON 错误）＋（`abstention_feedback=true` 时的）`image_not_observed` 错误信封。
-- **永不修复**：`stage_output_truncated`（token 预算问题，非反馈可治）、`input_modified`、`stage_template_changed`、`stage_adapter_invalid`、传输/HTTP 错误。
-- **三保护落地**：已成功阶段冻结不重新采样（修复只重试失败阶段，上下文完全冻结）；反馈只说哪错不给标准答案（2.2 硬规则）；视觉目标/brief/合同全程不变。
-
-### 2.5 预算语义（确定性）
-
-- 每阶段修复 ≤1 次；每 case 额外文本调用 ≤2 次（跨阶段累计）；图像预算不变（资格阶段为 0 生成）。
-- 计数示例：diagnose 修复成功（extra=1）→ compose 失败再修复（extra=2）→ evidence_review 再失败 → 预算耗尽，终态 `repair_budget_exhausted`，如实落账。
-- 每次修复调用 = 一次 actual call，逐 attempt 收据入账；observation 标 `repair_attempt: true` 并归档反馈全文。
-
-## 3. 协议合规论证（对照既有条款）
-
-对照 `2026-11-03-reference-stage-decisions.md` 第 75 行四项义务：① 每阶段/每案例文本调用限额声明于冻结任务（§2.1）；② 逐次计费（§2.5）；③ unknown-submission 对账保留（修复走既有 attempt 机制，不新增释放路径）；④ 冻结视觉目标（§2.4 三保护）。
-
-对照 v1_20261013 `02_STATE_AND_PROTOCOL.md`「image_not_observed 必须实际补齐附件/观察，不能用 format repair 替代」：本设计中 R2 反馈**不以格式修复替代观察**——附件本就已实际提供且 hash 校验通过（run_stage 强制），反馈仅陈述该传输事实并要求具体弃权理由；模型仍弃权则失败成立。该解释已在设计评审中显式确认，R2 结果单独标注，不据此断言模型真实观察能力。
-
-## 4. A5 批构成与对照
-
-- **修复对象（7 例）**：G01_A5_V2、G03_A5_V1/V2、G08_A5_V1/V2、G09_A5_V1/V2（spec 除 `case_id` 与新增 `stage_repair` 外与对应 A4 spec 逐字节一致）。
-- **对照案例（1 例，推荐）**：G01_A5_V1——同冻结内容 + 修复声明，验证"修复路径对成功案例零扰动"（预期 0 次修复、与 A4_V1 同结论）。
-- **报告口径**：A5 单列 repair-assisted 通过率；与 A4 一次性通过率并排呈现、绝不合并；R2 案例结论单独标注。
-- **发动机版本留痕**：A5 引擎较 A4 有代码变更（contracts/runner/stages/新模块），manifest rev13 记录引擎 hash；模板 digest 不变由测试钉死。
-
-## 5. 测试与验证（TDD）
-
-1. 违规清单生成器单测：缺顶级键/多键/枚举越界/范围/嵌套路径/非 JSON 文本/弃权变体文本（只含传输事实，无图像内容词）。
-2. 冻结不变量：同输入下 A4 模板 digest == A5 模板 digest；`repair_feedback` 不进入 `stage_template_changed` 校验面。
-3. runner 假端点端到端：首坏次好→成功且逐 attempt 计费；预算耗尽→`repair_budget_exhausted` 终态；成功阶段不重跑；永不修复类直接终态；`stage_repair` 缺省任务行为与现状逐比特一致（legacy 回归）。
-4. 验收复跑：`pytest -q engine/tests` 全绿（基线 1015 tests + 新增）。
-
-## 6. 风险与缓解
-
-| 风险 | 缓解 |
-|---|---|
-| 反馈被模型当"答案提示"过度拟合（如机械补齐键名仍语义空洞） | 反馈只给结构定位；资格结论以人工/盲评复核意图质量为准，不以 schema 通过为终点 |
-| R2 反馈诱发"不敢弃权"（该弃权时不弃权） | 反馈明确保留弃权通道（要求具体理由）；R2 结论单独标注；双臂同图仍双弃权则判真实能力边界 |
-| 预算语义漂移（多次修复挤占后续阶段） | 计数器实现为 case 级状态字段，单测钉死示例序列 |
-| A4/A5 引擎漂移污染可比性 | rev13 记录引擎 hash；模板 digest 回归钉死；A5 结果永不回写 A4 口径 |
-
-## 7. 留痕清单
-
-每 A5 案例：spec（含 stage_repair 声明）、逐 attempt request/result（含反馈全文、usage、elapsed）、state.json、journal、SPEC_LEDGER 行、manifest rev13、引擎 hash、资格报告（A4 一次性 / A5 repair-assisted 双口径）。
+- ❌ 我之前"预算无法解决"说过头了 → ✅ **正确表述**：True 需要 ≥52k 上下文 + ≥16k 完成预算才能完赛（E3: total 51,579），能完赛但贵 25× 且倾向拒绝
+- **无论如何都绕不开 agent.py 传输补丁**：默认 2048 预算 + None 不安全 = 必崩。补丁内容（~4 行）：L45 None-safe、settings 透传 `chat_template_kwargs`（thinking 开关）与 max_tokens 写入 M3 配置
+- 剩下的是**实验设计选择**而非技术障碍：M3.qwen 用 false（25.6s 出可执行 policy）还是接受 true 的保守拒绝（作为一个"谨慎对照臂"）——这由您的科学意图决定。批准补丁即改。
