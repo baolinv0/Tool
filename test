@@ -1,143 +1,50 @@
-**我的判断：同意修复客户端，`M3.qwen` 主实验先采用 `thinking=false`；同时澄清“训练数据构造”的任务定义。`thinking=true` 暂时保留为诊断配置，当前 E3 更适合记录为任务理解偏差，不能据此把它定义成“谨慎对照臂”。**
+Description
 
-按你此前确定的优先级，**627 秒本身不是淘汰 True 的理由，关键是它能否提出更有效的数据策略。** 目前 False 已产生可执行提案，可以进入训练验证；True 的拒绝理由则暴露了一个比调用成本更重要的问题。
+This week, we used Qwen-Image-2.1 as the executor and reproduced the frozen region-editing protocol locally. We evaluated reference matching on 21 image pairs, using AITone baseline outputs as inputs and iPhone images as references. The experiment compared region-constrained and global prompts, with SoftISP redraw as an additional baseline.
+1. Reproduced the eight-condition region-editing protocol with seed 42 and archived the experiment records, manifests, and reports.
+2. Compared region-constrained and global prompts on 21 pairs using quantitative metrics, region-mask checks, and visual comparison grids.
+Results
 
-我核查了 PR 当前提交 [`aa839c9`](https://github.com/baolinv0/TMOXR/commit/aa839c9460fde9753ff71a08d7ef4ac25f232035) 的客户端与配置。你提到的两份探针 JSON 不在该提交中，下面的实验数值依据你贴出的记录，代码判断依据仓库实现。
+Figure 1. Visual comparison
+Each row shows the AITone input, iPhone reference, SoftISP redraw, Qwen output with a region-constrained prompt, and Qwen output with a global prompt. Across the 21 pairs, both Qwen settings largely preserve the input framing and content while making relatively conservative adjustments. SoftISP follows the reference exposure more closely in some cases, but occasionally produces undesirable results, such as over-darkening in pair 3.
 
-## 1. E3 的问题是混淆了“制造训练难点”和“直接修复图像”
+Figure 2. Region-constrained vs. global prompts
+The plots compare per-pair face and background changes (left), alignment of the face-to-background ratio with the reference (center), and warmth alignment with the reference (right). The distributions overlap substantially, indicating that the tested region-constraint wording had little measurable effect under these experimental conditions. More explicit spatial guidance, such as masks or region annotations, is a candidate for improving region-level control and should be evaluated separately.
 
-你转述的拒绝逻辑是：
+我将原文中“文本约束完全无效”和“必须使用空间控制”收紧为当前实验能够支持的结论：两组结果高度相似，但还不能仅凭这组实验断定所有区域提示词都无效，或证明 mask 一定有效。
 
-> `local_exposure` 只能把输入变暗，因此不能解决模型的 under-recovery。
 
-**对于当前 TMOXR 任务，这个推论不成立。**
 
-我们的操作链是：
 
-\[
-(x,y)
-\;\longrightarrow\;
-\bigl(T_{\pi}(x),y\bigr)
-\;\longrightarrow\;
-\theta'=\operatorname{Train}(\theta,\mathcal D_{\pi})
-\;\longrightarrow\;
-\operatorname{PSNR}_{\mathrm{real}}(\theta').
-\]
 
-`local_exposure` 负责让可靠种子承载欠曝困难；网络随后通过训练，学习从这些输入恢复原 GT。**增强操作不需要让冻结 parent 的即时预测变好。**
 
-例如，原始配对中主体曝光正常，模型能够较好恢复。将输入主体适度压暗、保留合法的原 GT，可以增加“暗主体应该恢复到什么程度”的监督。它是否改善真实欠曝样本，交由后续受控训练判断。
 
-所以，E3 的拒绝理由不能直接解释为“更谨慎”。它把训练增强算子当成了推理阶段的修图算子。
 
-这一误解也能从当前 Prompt 找到可能的来源：旧版 `agent.py` 的系统提示强调诊断、合法算子及 `gt_rule=unchanged`，但没有明确写出“构造配对后会继续训练，再评价新模型”。见 [当前系统提示](https://github.com/baolinv0/TMOXR/blob/aa839c9460fde9753ff71a08d7ef4ac25f232035/rsi/agent.py#L11)。
 
-### 应补充的任务定义
 
-建议对 False 和 True **共同**加入以下说明：
+rephrase 分析结果：• Spatial cues are required for regional control: Text-only region prompts fail because the model relies on a built-in face-brightening default regardless of your wording; explicit spatial signals are the only way to guide local edits.
+- Superior color stability, weaker brightness matching: Qwen-Image-2.1 reliably in keeping colors and white balance consistent without failing, but it is too conservative when trying to match the brightness levels.
 
-```text
-Your action constructs training pairs for subsequent model training.
-It is not an inference-time correction of the current prediction.
 
-Input-only attenuation may deliberately introduce a difficulty.
-The target remains unchanged only under the registered invariance contract.
-The augmented pair will be used to update the model.
 
-Do not reject a construction solely because it darkens the input or worsens
-the frozen parent's immediate prediction. Evaluate whether it is a legal,
-plausible training construction. Its training utility will be measured later.
-Abstention remains allowed when no legal construction exists.
-```
 
-这是补齐任务定义。Agent 仍然可以因种子不足、GT 保持条件不满足、操作超出权限等原因拒绝。
 
-**也不要把 p03 的验证集分数写进 Prompt，作为要求它接受该方向的依据。** 用任务定义和训练侧证据说明构造目的即可，保持现有 train-only 边界。
 
-## 2. 预算结论还需要收窄，但无需继续做预算搜索
 
-这四次实验已经足以作出当前工程决策。精确表述应是：
 
-| 已有证据 | 能支持的判断 |
-|---|---|
-| E0、E0b 都以 `length` 结束 | 当前载荷在已测试的两个较低预算下，未能生成完整最终回答 |
-| E3 在 `65536 / 28000` 下结束 | **这套配置已验证能够完成**，本次消耗 15,556 completion、51,579 total |
-| E2 在 False 下产生合法 policy | 当前载荷有一个成本较低、可继续进入训练验证的配置 |
 
-因此：
 
-- “reasoning 消耗无界”应改成**低预算下发生推理截断**；E3 已经表明它会结束。
-- “至少需要 52k 上下文、16k 完成预算”还不能作为配置门槛。**52k/16k 是根据一次运行消耗得到的估计，已实际验证的是 65,536/28,000。**
-- “永远拒绝提案”应改成**本次固定载荷返回了拒绝**。尤其在任务定义存在上述歧义时，先修正语义更有价值。
+可以，我会保留这两条核心观察，同时避免把模型的内部机制和空间提示的作用写得过于确定。
 
-现在不必二分搜索最低 token 预算。保留 E3 的成功配置，用于一次任务理解复测就够了。
 
-## 3. 客户端补丁必须做，而且应覆盖两个入口
 
-你指出的崩溃机制成立：`content=None` 后直接调用 `startswith()`，会产生未捕获的 `AttributeError`。
 
-我还确认了两个相关事实：
 
-- **`pattern_agent.py` 也有同样的问题。** 它虽然额外捕获 `TypeError`，但 `None.startswith()` 仍然是 `AttributeError`。
-- **默认请求超时是 180 秒。** 若保留耗时约 628 秒的 True 配置，需要同步调整超时，仅增大 `max_tokens` 不完整。
 
-来源：[旧客户端](https://github.com/baolinv0/TMOXR/blob/aa839c9460fde9753ff71a08d7ef4ac25f232035/rsi/agent.py#L34-L68)、[模式客户端](https://github.com/baolinv0/TMOXR/blob/aa839c9460fde9753ff71a08d7ef4ac25f232035/rsi/pattern_agent.py#L77-L126)、[M3.qwen 配置](https://github.com/baolinv0/TMOXR/blob/aa839c9460fde9753ff71a08d7ef4ac25f232035/configs/M3/M3.qwen.yaml)。
 
-### 建议的补丁范围
 
-| 修改 | 需要保证的行为 |
-|---|---|
-| 检查 `finish_reason` 和 `content` 类型、非空性 | 截断、空响应进入受控失败及有限重试，保留明确错误类型 |
-| 校验解析后的 JSON 对象 | 格式错误不能绕过已有响应验证 |
-| 透传 `chat_template_kwargs` | 配置中的 thinking 开关真正进入请求 |
-| 显式配置 `max_tokens`、`timeout` | 两种模式采用各自明确的请求预算 |
-| 更新请求指纹与日志 | thinking 参数进入缓存身份，同时记录实际参数、结束原因与 usage |
-| 同步两个客户端 | `M3.qwen` 与后续 `M3.patterns` 都获得修复 |
 
-尤其要分清三类结果：
 
-```text
-truncated / empty_response   → 请求没有产生可用答案
-invalid_policy              → 产生了答案，但不满足契约
-no_legal_action             → 产生了合法、明确的弃权决定
-```
 
-**空响应不能转换成 `no_legal_action`。** 否则又会把传输失败混入“Agent 判断没有合法策略”的实验统计。
-
-另外，当前实现使用 `urllib` 直接发送 JSON，`chat_template_kwargs` 应放在请求体顶层；官方示例中的 `extra_body` 是 OpenAI Python SDK 的传参入口。Qwen 的 vLLM 文档明确展示了这一差别。[Qwen](https://qwen.readthedocs.io/en/latest/deployment/vllm.html?utm_source=chatgpt.com)
-
-主实验配置可以先明确为：
-
-```yaml
-qwen:
-  temperature: 0
-  max_tokens: 4096
-  timeout: 180
-  chat_template_kwargs:
-    enable_thinking: false
-```
-
-True 诊断配置沿用 E3 已成功的上下文与完成预算，并将客户端超时显式设为能够覆盖该次耗时的值，例如 `1200` 秒。两种模式使用独立输出目录；`pattern_agent.py` 的请求指纹也必须包含新增 thinking 参数，避免缓存串用。
-
-## 4. p03 的结果值得继续推进，但它回答不了 thinking 模式的优劣
-
-你给出的差值是：
-
-\[
-28.3035-28.2322=+0.0713\ \mathrm{dB}.
-\]
-
-它支持继续检验局部曝光增强这个方向。若 baseline 是未继续训练的 R0，则该差值还包含继续训练的贡献，下一步仍应看相对同 parent、同预算 C 的增益。
-
-不过，**纠正 E3 的任务理解，并不依赖这 0.0713 dB 是否最终归因于增强。** 即使某次训练没有提升，“输入变暗不能直接提亮输出”也不是否定训练数据构造的充分理由。
-
-同样，E2 产生合法 policy，证明的是它可以进入下一阶段；最终 ISP 表现还要由这份 policy 的实际训练结果决定。
-
-## 5. 下一步就按这个顺序执行
-
-1. **修复两个客户端，并补充共享任务定义。** 回归覆盖空内容、截断、合法弃权、参数透传和缓存隔离。
-2. **用澄清后的同一载荷，对 False/True 各重放一次。** False 使用 `4096`；True 沿用 E3 的成功预算。检查它是否正确理解“构造训练难点”，以及拒绝理由是否对应真实约束。
-3. **主线先用 False 的合法提案进入受控训练。** 用同 parent、同训练预算的 C 判断增益。
-4. **True 保留为后续消融。** 如果澄清后能提出不同且有价值的策略，再比较其训练收益与调用成本；名称直接使用 thinking-enabled planner，弃权作为观测结果记录。
-
-**可以按这个范围实施补丁。当前最值得修正的是：让 Agent 清楚，它的工作是为下一轮训练准备有效监督，而不是要求每个增强算子立即修好当前图像。**
+- Limited regional control with text-only prompts: The tested region-constrained prompts produced results similar to the global prompts, with a tendency to brighten faces. Explicit spatial guidance, such as masks or region annotations, is a promising next step for improving local control.
+- Stable color, conservative brightness adjustment: Qwen-Image-2.1 generally preserved color and white balance, but its brightness adjustments were often too conservative to match the reference.
