@@ -1,29 +1,105 @@
-双臂重放完成，传输层全部经受住实战检验，但暴露出新的一致性问题源。汇总：
+**按 v0.2 处理：① 同意补充共享配方契约，并将 False/True 各重放一次；② 本轮无需同步 `pattern_agent.py`，它属于 v0.3；③ M1 按原协议完成，当前结果已经指向 A 弱于同预算 C。**
 
-## 补丁实施 + 重放验证报告（17:05）
+我前面把 v0.3 的同步工作带入了这轮讨论，范围扩大了。现在先把 v0.2 的实验完成。
 
-### ✅ 已落地（TDD 全程，回归 86/86 绿）
+## ① 可以加 Prompt，但要准确说明“共享配方池”的执行方式
 
-- **agent.py**：SYSTEM 追加任务定义（您的原文）；`chat_template_kwargs` 请求体顶层透传；content None/空 → `truncated`/`empty_response` 受控失败；非对象 JSON → `invalid_policy`；transport + finish_reason 全路径记录（含失败路径）
-- **配置**：M3.qwen.yaml（0/4096/180/false 显式）；新增 **M3.qwen_thinking.yaml**（诊断臂 28000/1200/true，独立输出目录）；accept_qwen.py 加 `false|thinking` 模式参数
-- **新测试 ×5**：任务定义存在性、空内容受控失败≠弃权、透传+记录、非对象 JSON、domain 契约守护
-- **重要澄清**：您指出的 domain/gt_rule 风险经核实**已被现有架构覆盖**——propose 内 `validate_policy → augment.validate_recipe` 在提案期即强制（L13 还限 recipes≤4）。薄 schema 不会拖到训练期。新测试已锁定该行为
-- ⚠️ agent.py 改动改变 code_fingerprint（M1.single 若中断续跑需先恢复旧文件，原文件已备份 `verification/agent_py_original_pre_patch_20261103.py`）；**pattern_agent.py 本机不存在**（aa839c9 私有库拉不到）——同步缺口待您处理
+你对 `domain/gt_rule` 的核查成立：**它们已经在提案阶段被验证，不应继续列为未覆盖风险。** v0.2 的 `validate_policy()` 同时限制 `recipes` 为 1–4 条，并调用 `validate_recipe()` 检查颜色域与 GT 规则。[策略校验](https://github.com/baolinv0/TMOXR/blob/7385c91ad14c87fdfcfe6479c21594d430efbbee/rsi/policy.py#L8-L18) · [配方校验](https://github.com/baolinv0/TMOXR/blob/7385c91ad14c87fdfcfe6479c21594d430efbbee/rsi/augment.py#L8-L16)
 
-### 📊 澄清后双臂重放结果（新 SYSTEM 首次实战）
+这次需要补齐的是：**让模型生成的结构与已有执行器一致。**
 
-| | False（4096/180） | True（28000/1200） |
-|---|---|---|
-| 结果 | 失败：`invalid_policy_json`（char 7620 截断，2 次） | 失败：`bounded recipe count required`（938s，2 次） |
-| 传输层表现 | ✅ 受控失败、正确标签、重试入环 | ✅ 同左；任务理解**已纠正**——不再 no_legal_action，真的在构造提案 |
-| 探针复现 | 同设置单发成功：1004 tok 合法 JSON，但 **10 条逐 seed 配方** | — |
+你建议的两行方向正确，但 `shared recipes applied to all seeds` 仍可能被理解为“每张图依次执行全部配方”。实际 v0.2 是：
 
-**新瓶颈不是传输而是 schema 漂移**：两臂都倾向把"10 个 seeds"镜像成"10 条逐 seed 配方"，撞上协议既有边界（recipes ≤4 + 必填字段 domain/gt_rule/ev_range/sigma）。SYSTEM 目前只说 "recipes" 未写数量与必填字段——数值政策产出的是 **1 条共享配方**（ev_range 区间），模型没有学到这个范式。
+> 每次合成曝光，独立选一个 seed、选一个 recipe，再从该 recipe 的 `ev_range` 中采样 EV，只执行这一个配方。[实际抽样逻辑](https://github.com/baolinv0/TMOXR/blob/7385c91ad14c87fdfcfe6479c21594d430efbbee/rsi/sampling.py#L89-L97)
 
-**建议（待您批准，~2 行 prompt 澄清）**：SYSTEM 增补 `"Return 1-4 shared recipes applied to all seeds. Each recipe must include operator, ev, ev_range, sigma, domain='linear_srgb', gt_rule='unchanged'. Do not emit per-seed recipes."` 然后再各重放一次。
+建议追加下面这段：
 
-### 📈 M1.single 顺带进展
+```text
+Return a shared pool of 1–4 recipes, regardless of the number of seed_ids.
+For each synthetic example, the sampler independently selects one seed and
+one recipe, then samples EV uniformly from that recipe's ev_range.
+Do not emit per-seed recipe assignments or sequential operation lists.
 
-A/22=**28.2941**（C/22=28.3973），C/33 已完成，A/33 跑最后一段。当前格局：A 臂两 seed 稳定落后配对 C ≈0.09–0.10 dB，C 臂复现性极佳（σ≈0.0004）。
+For every local_exposure recipe, explicitly include operator, ev,
+ev_range=[lo, hi], sigma, domain="linear_srgb", and gt_rule="unchanged".
+Use 0 <= lo <= hi <= max_ev, 0 <= ev <= max_ev, and 0 <= sigma <= 64.
+One shared recipe with an EV range is sufficient when the same construction
+applies across the selected seeds.
+```
 
-待您指示：① 是否加 recipe schema prompt 澄清并重放；② pattern_agent.py 同步方式；③ 其余照旧（M1 自动推进，预计 11-04 收官）。
+这里保留了 1–4 条配方的选择空间，没有强制模型模仿数值策略只输出一条。
+
+还有一个小区别：**`domain/gt_rule` 是现有验证器强制要求；`ev_range`、`sigma` 在代码中允许默认值。** 本次要求显式输出后两者，是为了统一提案形式、减少隐式默认，并非修补它们缺失时一定会穿透验证的漏洞。
+
+### 重放怎么做
+
+使用同一冻结输入，两个模式共同增加上述说明，其他设置保持不变：
+
+- False：`4096 / 180 / false`。
+- True：`28000 / 1200 / true`。
+- 各运行一次完整调用，保留现有每调用最多两次尝试，使用新输出目录。
+
+这次验收看四件事：**回答完整、通过 JSON 解析、通过现有 policy 校验、形成符合执行器语义的共享配方池。** 通过后就进入候选短筛。
+
+True 已经从“因为只能变暗而拒绝”转为构造提案，说明任务定义澄清发挥了作用。现在暴露的是动作表达问题，值得完成这次修正。
+
+### False 的错误标签还要核对一下
+
+`char 7620` 只是 JSON 解析器报告的位置，**单凭它不能确认生成被截断**。应按已记录的 `finish_reason` 区分：
+
+| 实际响应 | 分类 |
+|---|---|
+| `finish_reason=length`，包括非空但不完整的 JSON | `truncated` |
+| `finish_reason=stop`，但 JSON 语法不合法 | `invalid_policy_json` |
+| JSON 合法，但有 10 条配方 | `invalid_policy`，记录具体约束错误 |
+
+如果补丁目前只在 `content=None/空` 时识别 `length`，应把**非空截断响应**也覆盖进去。这样才能判断剩下的失败究竟来自输出预算还是结构不合规。
+
+## ② `pattern_agent.py` 不是当前 v0.2 的同步缺口
+
+**这轮只维护 `agent.py`。**
+
+`pattern_agent.py` 服务于 v0.3 的 `construction_specs`：每个规范有自己的种子池和配方池。它依赖模式归纳、证据包与对应调度模块，单独拷入 v0.2 不会完成升级。[v0.3 接口](https://github.com/baolinv0/TMOXR/blob/aa839c9460fde9753ff71a08d7ef4ac25f232035/rsi/pattern_agent.py)
+
+因此，当前处理方式是：
+
+- 将 `pattern_agent.py` 同步事项移到 **v0.3 升级任务**。
+- v0.2 的 M1、M3.qwen 继续使用当前协议。
+- 后续升级时，在独立目录迁入完整 v0.3 版本，再同步客户端修复。
+
+### 当前更需要处理的是 M1 与 Qwen 调试的代码目录隔离
+
+原代码快照不仅用于中断恢复，**还用于 M1 完成后的 freeze 和 Test**。v0.2 在这两个阶段都会重新核对 `code_fingerprint`。[指纹计算](https://github.com/baolinv0/TMOXR/blob/7385c91ad14c87fdfcfe6479c21594d430efbbee/rsi/runner.py#L20-L21) · [freeze/Test 检查](https://github.com/baolinv0/TMOXR/blob/7385c91ad14c87fdfcfe6479c21594d430efbbee/rsi/runner.py#L344-L365)
+
+建议现在把两份代码固定下来：
+
+| 用途 | 使用代码 |
+|---|---|
+| M1 的完成、恢复、freeze、Test | 启动该 run 时的原始代码快照 |
+| Qwen Prompt 与传输调试 | 带补丁的独立 v0.2 目录 |
+
+你已有原 `agent.py` 备份。收官前，用原文件恢复对应快照，并核对指纹与 M1 的 `state.json` 一致。
+
+## ③ M1 继续跑完，但研究判断应转向“当前 A 策略没有增益”
+
+seed 22 的配对差值为：
+
+\[
+\Delta_{22}=28.2941-28.3973=\boxed{-0.1032\ \mathrm{dB}}.
+\]
+
+结合你报告的另一 seed 同样落后约 0.09–0.10 dB，**当前证据已经支持：这套 A 数据策略弱于同预算继续训练 C。** 现在不应再把此前 `p03 > R0` 作为增强有效的主要依据；真正有解释力的是 `A−C`。
+
+继续完成 A/33，保持当前配方、比例和训练预算。完成后，报告至少保留：
+
+| seed | Parent/R0 | C | A | A−C |
+|---|---:|---:|---:|---:|
+| 11 | 已有记录 | 已有记录 | 已有记录 | 配对差值 |
+| 22 | 已有记录 | 28.3973 | 28.2941 | −0.1032 |
+| 33 | 已有记录 | 已完成 | 待完成 | 待计算 |
+
+如果第三个 seed 延续当前趋势，就按既有晋级规则处理，并将本轮结论写为：
+
+> **在当前构造策略与训练预算下，A 未超过同 parent、同预算的继续训练对照；增加的数据干预降低了整体验证 PSNR。**
+
+随后再利用已有逐图结果检查：损失是否集中在特定场景、目标难例是否改善但其他样本退化，以及短筛收益能否延续到正式训练。**本轮先保留这个完整结果，Qwen 新提案在新的 run 中验证。**
