@@ -1,50 +1,29 @@
-Description
+双臂重放完成，传输层全部经受住实战检验，但暴露出新的一致性问题源。汇总：
 
-This week, we used Qwen-Image-2.1 as the executor and reproduced the frozen region-editing protocol locally. We evaluated reference matching on 21 image pairs, using AITone baseline outputs as inputs and iPhone images as references. The experiment compared region-constrained and global prompts, with SoftISP redraw as an additional baseline.
-1. Reproduced the eight-condition region-editing protocol with seed 42 and archived the experiment records, manifests, and reports.
-2. Compared region-constrained and global prompts on 21 pairs using quantitative metrics, region-mask checks, and visual comparison grids.
-Results
+## 补丁实施 + 重放验证报告（17:05）
 
-Figure 1. Visual comparison
-Each row shows the AITone input, iPhone reference, SoftISP redraw, Qwen output with a region-constrained prompt, and Qwen output with a global prompt. Across the 21 pairs, both Qwen settings largely preserve the input framing and content while making relatively conservative adjustments. SoftISP follows the reference exposure more closely in some cases, but occasionally produces undesirable results, such as over-darkening in pair 3.
+### ✅ 已落地（TDD 全程，回归 86/86 绿）
 
-Figure 2. Region-constrained vs. global prompts
-The plots compare per-pair face and background changes (left), alignment of the face-to-background ratio with the reference (center), and warmth alignment with the reference (right). The distributions overlap substantially, indicating that the tested region-constraint wording had little measurable effect under these experimental conditions. More explicit spatial guidance, such as masks or region annotations, is a candidate for improving region-level control and should be evaluated separately.
+- **agent.py**：SYSTEM 追加任务定义（您的原文）；`chat_template_kwargs` 请求体顶层透传；content None/空 → `truncated`/`empty_response` 受控失败；非对象 JSON → `invalid_policy`；transport + finish_reason 全路径记录（含失败路径）
+- **配置**：M3.qwen.yaml（0/4096/180/false 显式）；新增 **M3.qwen_thinking.yaml**（诊断臂 28000/1200/true，独立输出目录）；accept_qwen.py 加 `false|thinking` 模式参数
+- **新测试 ×5**：任务定义存在性、空内容受控失败≠弃权、透传+记录、非对象 JSON、domain 契约守护
+- **重要澄清**：您指出的 domain/gt_rule 风险经核实**已被现有架构覆盖**——propose 内 `validate_policy → augment.validate_recipe` 在提案期即强制（L13 还限 recipes≤4）。薄 schema 不会拖到训练期。新测试已锁定该行为
+- ⚠️ agent.py 改动改变 code_fingerprint（M1.single 若中断续跑需先恢复旧文件，原文件已备份 `verification/agent_py_original_pre_patch_20261103.py`）；**pattern_agent.py 本机不存在**（aa839c9 私有库拉不到）——同步缺口待您处理
 
-我将原文中“文本约束完全无效”和“必须使用空间控制”收紧为当前实验能够支持的结论：两组结果高度相似，但还不能仅凭这组实验断定所有区域提示词都无效，或证明 mask 一定有效。
+### 📊 澄清后双臂重放结果（新 SYSTEM 首次实战）
 
+| | False（4096/180） | True（28000/1200） |
+|---|---|---|
+| 结果 | 失败：`invalid_policy_json`（char 7620 截断，2 次） | 失败：`bounded recipe count required`（938s，2 次） |
+| 传输层表现 | ✅ 受控失败、正确标签、重试入环 | ✅ 同左；任务理解**已纠正**——不再 no_legal_action，真的在构造提案 |
+| 探针复现 | 同设置单发成功：1004 tok 合法 JSON，但 **10 条逐 seed 配方** | — |
 
+**新瓶颈不是传输而是 schema 漂移**：两臂都倾向把"10 个 seeds"镜像成"10 条逐 seed 配方"，撞上协议既有边界（recipes ≤4 + 必填字段 domain/gt_rule/ev_range/sigma）。SYSTEM 目前只说 "recipes" 未写数量与必填字段——数值政策产出的是 **1 条共享配方**（ev_range 区间），模型没有学到这个范式。
 
+**建议（待您批准，~2 行 prompt 澄清）**：SYSTEM 增补 `"Return 1-4 shared recipes applied to all seeds. Each recipe must include operator, ev, ev_range, sigma, domain='linear_srgb', gt_rule='unchanged'. Do not emit per-seed recipes."` 然后再各重放一次。
 
+### 📈 M1.single 顺带进展
 
+A/22=**28.2941**（C/22=28.3973），C/33 已完成，A/33 跑最后一段。当前格局：A 臂两 seed 稳定落后配对 C ≈0.09–0.10 dB，C 臂复现性极佳（σ≈0.0004）。
 
-
-
-
-
-rephrase 分析结果：• Spatial cues are required for regional control: Text-only region prompts fail because the model relies on a built-in face-brightening default regardless of your wording; explicit spatial signals are the only way to guide local edits.
-- Superior color stability, weaker brightness matching: Qwen-Image-2.1 reliably in keeping colors and white balance consistent without failing, but it is too conservative when trying to match the brightness levels.
-
-
-
-
-
-
-
-
-
-
-可以，我会保留这两条核心观察，同时避免把模型的内部机制和空间提示的作用写得过于确定。
-
-
-
-
-
-
-
-
-
-
-
-- Limited regional control with text-only prompts: The tested region-constrained prompts produced results similar to the global prompts, with a tendency to brighten faces. Explicit spatial guidance, such as masks or region annotations, is a promising next step for improving local control.
-- Stable color, conservative brightness adjustment: Qwen-Image-2.1 generally preserved color and white balance, but its brightness adjustments were often too conservative to match the reference.
+待您指示：① 是否加 recipe schema prompt 澄清并重放；② pattern_agent.py 同步方式；③ 其余照旧（M1 自动推进，预计 11-04 收官）。
