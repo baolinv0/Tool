@@ -1,1 +1,67 @@
 在读别人是怎么构建问题的、用什么思路解决的。她写开题报告的时候，导师改了三遍都说“没想到你能想到这个角度”，因为她不是随便套模型，而是把前人怎么研究、这套研究还有哪些缝隙，自己一个一个地梳理过。把问题看得透、路走得稳、能把不确定变成结构的人
+
+
+**与探针 G01_R0_V1_d4 完全同款的双重签名失败**：
+
+## G01_R0_V2_d4 失败链（stage_calls=2，diagnose 阶段终止）
+
+| attempt | 发生了什么 |
+|---|---|
+| a000 | 模型把**单条 finding 平铺到文档根**（根上出现 confidence/kind/observation 等 5 个意外属性，缺 findings/protected_content 等 8 必填）→ stage_repair 触发，反馈违规清单 |
+| a001 | 结构修好 → **契约层拦截**：`texture_and_noise_observation` 标 **preserve 却挂了 1 个 delta** → 修复配额（1/stage）用尽 → 如实终止 |
+
+## 与金标和探针的对照（关键证据）
+
+| 案例 | texture_and_noise 维度 | 结果 |
+|---|---|---|
+| G01_A4_V1（11-03 金标，一次过） | preserve + **deltas=0**（契约正确写法） | ✅ ready |
+| G01_R0_V1_d4 探针（昨晚） | preserve + **deltas=1** → 拒 | ❌ 同款失败 |
+| G01_R0_V2_d4（今晨） | preserve + **deltas=1** → 拒 | ❌ 同款失败 |
+
+## 归因（保守立场）
+
+- **直接原因**：模型判断自相矛盾——诚实观察“G01 无明确纹理目标”（标 preserve）却又想记录一条 desired_change（挂 delta）。引擎契约 `(status=="targeted")==bool(ids)` 正确拦截，属**内容相关能力墙**，非工程故障。
+- **值得注意的模式**：G01 双臂在**当前服务实例**上连续两次同款失败（含 a000 同款结构错）；而 11-03 的实例上 G01 一次过。温度 0 下同实例内高度可复现、**跨重启数值漂移**是已知现象——支持“G01 内容处于 texture 决策边界 + 实例间漂移翻向”的调查方向，但**不能断言模型/引擎变差**（金标实例证据反证）。
+- 修复回路本身行为正确：反馈不给答案、限额、留痕、如实终止。
+
+## 对 R4 门槛的影响
+
+适配器臂当前 **0/2**（探针 V1 + G01_V2），门槛是 ready≥6/8——剩余 6 槽（G03/G08/G09 × V1/V2）**必须全过**才达 6/8，或者……不可能了（0/2 已定，最多 6/8 刚好压线）。即：**只要 G03/G08/G09 六槽里再挂 1 个，dev-redo 不达标 → 回退协议侧**。批后若如此，G01 双臂失败会成为归因重点（建议届时做同实例重放 A4 金标对照，隔离“实例漂移”变量）。
+
+批仍在跑（G03_R0_V1_d4 diagnose 中，批 3/11）。
+
+原因：
+机制链查清了（提示、装配、契约三层都核实过代码）。分四层回答“为什么会出现”：
+
+## ① 根因：schema 表达力缺口——规则模型看不见
+
+| 层 | 模型看到什么 | 规则在哪 |
+|---|---|---|
+| 模型可见（适配器紧凑 schema + 提示） | 每个维度：`status`（6 选 1 枚举）+ `reason` + `deltas` 数组 | **没有**“preserve ⇒ deltas 必须为空”这条规则。适配器提示只说 "coverage status and reason. Program assigns finding/delta IDs and coverage links"（`stage_adapter.py`） |
+| 程序装配 | 把模型写的每个 delta 原样编号、挂进 coverage 行 | 装配器不判断、忠实搬运（红线①：判断归模型） |
+| 契约校验 | — | `(status=="targeted")==bool(delta_ids)` 只在**装配后**的程序侧执行（`reference_retouch.py:143`） |
+
+**JSON Schema 表达不了跨字段不变量**——这是 schema 机制的固有缺口。跨字段语义规则只能事后校验，模型事先无从得知。
+
+## ② 诱因：模型的边界判断“没有合法槽位可放”
+
+模型对 G01 纹理的真实判断是个**混合体**（两次失败案原文逐字相同）：
+
+```
+reason:  "Reference texture is comparable and natural; preserve ... only align perceived clarity"
+delta:   "Preserve authentic source texture; only reduce shadow noise to approach reference clarity"
+```
+
+即“整体保留，但**阴影噪点可以轻微降一点**”。schema 只给了两个表达槽：status（单选）和 deltas（动作记录）。模型想同时表达“整体 preserve”+“一条小动作”，就把小动作塞进了 delta——**用动作槽表达保留意图**，恰好踩中契约明令禁止的混合态。两条自洽出路它没走：① 标 targeted 保留 delta（把降噪当真目标）；② 纯 preserve、把 nuance 写进 reason——**金标 A4 就是这么做的**（"B texture is not a safe transfer target"，deltas=[]）。
+
+## ③ 为什么契约必须拦（设计意图）
+
+`preserve` 维度带 delta 是最危险的矛盾信号：**嘴上说不动手，却给编辑器递了动作清单**——若放行，compose 阶段它可能变成 target，"保留"语义静默变编辑。所以 fail-closed 拦截是协议本意，而非误伤。
+
+## ④ 为什么现在才出现、且连续两次同款
+
+- 11-03 金标实例：同图同模型温度 0，判断落在“纯 preserve”一侧 → 一次过
+- 当前重启后的实例：数值漂移把边界判断翻向“混合体”一侧；**同实例内确定性** → 双臂（V1 探针/V2）输出逐字相同
+- repair 救不回来：a000 的反馈只能给 schema 违规清单（根级），**教不了模型它从未被告知的跨字段规则** → a001 修完结构仍踩同一条线
+
+**一句话**：schema 层表达不了跨字段规则（模型无从知）+ 边界判断没有“软保留”表达槽（模型只能误用动作槽）+ 契约层按设计 fail-closed（必须拦模糊意图）——三层叠加，27B 在决策边界处必然踩线。金标实例没踩只是漂移翻向的另一侧。
