@@ -1,67 +1,142 @@
-在读别人是怎么构建问题的、用什么思路解决的。她写开题报告的时候，导师改了三遍都说“没想到你能想到这个角度”，因为她不是随便套模型，而是把前人怎么研究、这套研究还有哪些缝隙，自己一个一个地梳理过。把问题看得透、路走得稳、能把不确定变成结构的人
+## 一、核心判断
 
+这次 G01 失败，主要不是 27B 模型无法理解参考图像，也不是编辑能力不足，而是模型输出的诊断结果与程序要求的决策契约不一致。
 
-**与探针 G01_R0_V1_d4 完全同款的双重签名失败**：
+我更倾向于将其定义为：
 
-## G01_R0_V2_d4 失败链（stage_calls=2，diagnose 阶段终止）
+诊断决策与结构化输出契约之间的接口失败（Decision–Contract Mismatch）。
 
-| attempt | 发生了什么 |
-|---|---|
-| a000 | 模型把**单条 finding 平铺到文档根**（根上出现 confidence/kind/observation 等 5 个意外属性，缺 findings/protected_content 等 8 必填）→ stage_repair 触发，反馈违规清单 |
-| a001 | 结构修好 → **契约层拦截**：`texture_and_noise_observation` 标 **preserve 却挂了 1 个 delta** → 修复配额（1/stage）用尽 → 如实终止 |
+给出的第二份根因分析比第一份更接近问题本质，但其中有两个判断需要修正：
 
-## 与金标和探针的对照（关键证据）
+1. 不是 JSON Schema 天生无法表达跨字段约束。 标准 JSON Schema 可以使用 `if/then/else`、`oneOf` 等表达部分跨字段约束。当前使用的紧凑 schema 没有编码该约束，才是具体问题。
+2. 不能确认是实例数值漂移导致失败。 同实例输出重复、跨实例不同，只能说明存在运行差异，尚不能证明数值漂移是原因，更不能说 27B 在这个边界上必然失败。
 
-| 案例 | texture_and_noise 维度 | 结果 |
-|---|---|---|
-| G01_A4_V1（11-03 金标，一次过） | preserve + **deltas=0**（契约正确写法） | ✅ ready |
-| G01_R0_V1_d4 探针（昨晚） | preserve + **deltas=1** → 拒 | ❌ 同款失败 |
-| G01_R0_V2_d4（今晨） | preserve + **deltas=1** → 拒 | ❌ 同款失败 |
+## 二、具体失败机制
 
-## 归因（保守立场）
+当前流程可以简化为：
 
-- **直接原因**：模型判断自相矛盾——诚实观察“G01 无明确纹理目标”（标 preserve）却又想记录一条 desired_change（挂 delta）。引擎契约 `(status=="targeted")==bool(ids)` 正确拦截，属**内容相关能力墙**，非工程故障。
-- **值得注意的模式**：G01 双臂在**当前服务实例**上连续两次同款失败（含 a000 同款结构错）；而 11-03 的实例上 G01 一次过。温度 0 下同实例内高度可复现、**跨重启数值漂移**是已知现象——支持“G01 内容处于 texture 决策边界 + 实例间漂移翻向”的调查方向，但**不能断言模型/引擎变差**（金标实例证据反证）。
-- 修复回路本身行为正确：反馈不给答案、限额、留痕、如实终止。
+模型诊断
 
-## 对 R4 门槛的影响
+status = preserve
 
-适配器臂当前 **0/2**（探针 V1 + G01_V2），门槛是 ready≥6/8——剩余 6 槽（G03/G08/G09 × V1/V2）**必须全过**才达 6/8，或者……不可能了（0/2 已定，最多 6/8 刚好压线）。即：**只要 G03/G08/G09 六槽里再挂 1 个，dev-redo 不达标 → 回退协议侧**。批后若如此，G01 双臂失败会成为归因重点（建议届时做同实例重放 A4 金标对照，隔离“实例漂移”变量）。
+deltas = [降低阴影噪声]
 
-批仍在跑（G03_R0_V1_d4 diagnose 中，批 3/11）。
+Adapter 装配
 
-原因：
-机制链查清了（提示、装配、契约三层都核实过代码）。分四层回答“为什么会出现”：
+忠实保留 status 与 delta，分配 ID
 
-## ① 根因：schema 表达力缺口——规则模型看不见
+Contract 校验失败
 
-| 层 | 模型看到什么 | 规则在哪 |
-|---|---|---|
-| 模型可见（适配器紧凑 schema + 提示） | 每个维度：`status`（6 选 1 枚举）+ `reason` + `deltas` 数组 | **没有**“preserve ⇒ deltas 必须为空”这条规则。适配器提示只说 "coverage status and reason. Program assigns finding/delta IDs and coverage links"（`stage_adapter.py`） |
-| 程序装配 | 把模型写的每个 delta 原样编号、挂进 coverage 行 | 装配器不判断、忠实搬运（红线①：判断归模型） |
-| 契约校验 | — | `(status=="targeted")==bool(delta_ids)` 只在**装配后**的程序侧执行（`reference_retouch.py:143`） |
+preserve 要求 deltas 为空
 
-**JSON Schema 表达不了跨字段不变量**——这是 schema 机制的固有缺口。跨字段语义规则只能事后校验，模型事先无从得知。
+修复配额用尽 → diagnose 终止
 
-## ② 诱因：模型的边界判断“没有合法槽位可放”
-
-模型对 G01 纹理的真实判断是个**混合体**（两次失败案原文逐字相同）：
+核心契约是：
 
 ```
-reason:  "Reference texture is comparable and natural; preserve ... only align perceived clarity"
-delta:   "Preserve authentic source texture; only reduce shadow noise to approach reference clarity"
+(status == "targeted") == bool(delta_ids)
 ```
 
-即“整体保留，但**阴影噪点可以轻微降一点**”。schema 只给了两个表达槽：status（单选）和 deltas（动作记录）。模型想同时表达“整体 preserve”+“一条小动作”，就把小动作塞进了 delta——**用动作槽表达保留意图**，恰好踩中契约明令禁止的混合态。两条自洽出路它没走：① 标 targeted 保留 delta（把降噪当真目标）；② 纯 preserve、把 nuance 写进 reason——**金标 A4 就是这么做的**（"B texture is not a safe transfer target"，deltas=[]）。
+这意味着：
 
-## ③ 为什么契约必须拦（设计意图）
+| status   | deltas | 合法性 |
+| -------- | ------ | --- |
+| preserve | []     | 合法  |
+| preserve | [降噪]   | 不合法 |
+| targeted | [降噪]   | 合法  |
+| targeted | []     | 不合法 |
 
-`preserve` 维度带 delta 是最危险的矛盾信号：**嘴上说不动手，却给编辑器递了动作清单**——若放行，compose 阶段它可能变成 target，"保留"语义静默变编辑。所以 fail-closed 拦截是协议本意，而非误伤。
+模型同时输出了“保持纹理”和“轻微降低阴影噪点”，违反了当前协议。
 
-## ④ 为什么现在才出现、且连续两次同款
+但这里存在一个更重要的问题：
 
-- 11-03 金标实例：同图同模型温度 0，判断落在“纯 preserve”一侧 → 一次过
-- 当前重启后的实例：数值漂移把边界判断翻向“混合体”一侧；**同实例内确定性** → 双臂（V1 探针/V2）输出逐字相同
-- repair 救不回来：a000 的反馈只能给 schema 违规清单（根级），**教不了模型它从未被告知的跨字段规则** → a001 修完结构仍踩同一条线
+模型的诊断内容未必是错的，错误可能只在于没有将诊断转化为协议认可的最终决策。
 
-**一句话**：schema 层表达不了跨字段规则（模型无从知）+ 边界判断没有“软保留”表达槽（模型只能误用动作槽）+ 契约层按设计 fail-closed（必须拦模糊意图）——三层叠加，27B 在决策边界处必然踩线。金标实例没踩只是漂移翻向的另一侧。
+例如，模型可能确实观察到参考图像的阴影噪点更少，但认为差异不足以构成值得执行的编辑目标。
+
+那么正确表达应该是 `preserve + deltas=[]`，并在 `reason` 中说明存在轻微差异但不需要调整。
+
+如果降噪确实是参考目标，则应该输出 `targeted + 降噪 delta`。
+
+因此，关键不是缺少一个“软保留”状态，而是缺少明确的观察差异 → 判断是否值得编辑 → 输出合法动作的决策边界。
+
+## 三、为什么修复两次也没成功？
+
+其实两次修复面对的是不同层次的问题。
+
+- a000：结构失败。 单条 finding 被直接放到 JSON 根节点。这是序列化格式错误，反馈后已经修正。
+- a001：语义契约失败。 JSON 结构正确，但 `preserve + delta` 不符合状态与动作之间的对应关系。此时修复配额已耗尽。
+
+所以，不能直接得出“模型无法遵守契约”的结论，因为模型在生成时可能根本没有获得这条明确约束。
+
+同样，也不能把问题全部归结为 schema。即使加入结构约束，仍需要模型判断：这条小幅降噪究竟应该执行，还是只作为观察保留？
+
+这才是与参考图像精确匹配相关的实质问题。
+
+## 四、我建议怎么修复
+
+当前不需要增加新的 Agent、复杂的 repair 机制，也不需要增加 `soft_preserve` 状态。
+
+只修改两处。
+
+第一处：在 Adapter 提示中明确合法性规则。
+
+```
+For each coverage dimension:
+
+- status="targeted" requires at least one delta.
+- status="preserve" requires an empty deltas array.
+- If a difference is observed but no edit is justified,
+  describe it in reason and keep deltas empty.
+- Do not create an edit delta merely to describe
+  a difference or preservation intent.
+```
+
+第二处：明确 texture/noise 的决策标准。
+
+```
+A minor texture/noise difference does not automatically
+require an edit.
+
+Use "targeted" only when the reference provides a clear,
+actionable and safe texture/noise target.
+
+Otherwise use "preserve" and deltas=[].
+```
+
+这里不建议简单规定“只要有 delta 就自动改成 targeted”，因为这会改变模型的决策，可能把不应该执行的降噪变成编辑目标。
+
+同理，也不建议程序自动删除 preserve 下的 delta。程序应该负责验收，诊断决策仍由模型负责。
+
+## 五、最小验证实验
+
+只需要在同一个服务实例上重放 G01，不必立即扩展到全部 8 个样本。
+
+| 实验           | 输入  | 要回答的问题          |
+| ------------ | --- | --------------- |
+| A：原始提示       | G01 | 能否稳定复现当前失败      |
+| B：补充契约提示     | G01 | 明确告知规则后能否输出合法结构 |
+| C：金标 A4 相同配置 | G01 | 能否复现金标诊断及动作决策   |
+
+重点比较三项：`status`、`deltas`、`reason`，再检查与参考图像之间的实际差异是否支持该决策。
+
+判读很简单：
+
+- B 通过，且与金标决策一致： 主要是契约传递不足，不是诊断能力墙。
+- B 通过，但把 preserve 改成 targeted： 结构问题解决，但模型是否正确选择编辑目标仍未解决。
+- B 仍失败： 再检查适配器提示是否实际进入模型上下文、结构化输出约束是否生效。
+- 不同实例对相同输入产生不同决策： 再调查模型版本、推理参数、后端和数值非确定性。
+
+## 六、对 R4 门槛的判断
+
+目前适配器臂 0/2，剩余六槽必须全部通过才能达到 6/8，这个计算没有问题。
+
+但要区分两个结论：
+
+R4 验收未达标，不等于模型的参考图像诊断能力未达标。
+
+如果失败集中在 `preserve + delta` 这样的输出契约问题上，R4 测到的主要是当前协议与模型接口的兼容性，而不完全是模型的视觉判断能力。
+
+因此，我建议先完成上述 G01 单案例验证，再决定是否需要调整 R4。否则继续消耗六槽，可能只是在重复测试一个已定位的接口缺陷。
+
+最终结论：当前最有依据的根因是模型可见的输出规则不完整，加上对细微参考差异是否构成编辑目标的判定不明确。先修复规则传递并进行 G01 重放，比继续增加 repair 次数或归因于实例漂移更有实验价值。
