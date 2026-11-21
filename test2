@@ -1,179 +1,63 @@
+**根因判断：8004 服务没有完整落实输出合约，同时 Rewriter 接口让模型重新生成了本应由代码保管的锚句和权限。优先修这两处。**
 
+## 1. 格式失败：JSON 约束没有在实际输出链路中生效
 
-## 0. TL;DR
+**证据：**请求了 `json_object`，仍返回 Markdown 围栏。
 
-流水线中 **Rewriter 阶段**要求本地部署的 Qwen3-8B（qwen3_8_27b，自建 OpenAI 兼容服务）在"锚定替换"约束下输出**严格 JSON**（改写后的需求 IR + CF/CT/CFT 三个候选的替换文本）。
+**最可能的原因：**wrapper 接受了 `response_format`，但没有把它正确传入后端约束解码；也可能是具体版本中 reasoning 与约束解码的衔接失效。标准 vLLM 的 `json_object` 本来就会映射到结构化解码，不需要额外加 `guided_json` 才生效。[docs.vllm.ai](https://docs.vllm.ai/en/v0.11.1/api/vllm/entrypoints/openai/protocol/?utm_source=chatgpt.com)
 
-**核心问题：模型在两种意义上都不守合约——**
+**解决方案：**
 
-1. **格式不守**：请求了 `response_format={"type":"json_object"}`，但返回 content 里仍出现 markdown 围栏（```json ... ```）和 6954 字符的推理前缀（thinking 泄漏进 content）；
-2. **语义不守**：改写锁定"锚句"时模型整句重写而不是"原文保留 + 尾部追加"，编译期 `protected_requirement_modified`，三个候选全部判废。
+- 检查 wrapper 调用后端时，是否真正传入结构化输出参数。
+- 使用完整的 **`json_schema`**，约束 CF/CT/CFT、字段类型和额外字段。
+- 用一个极小 Schema 对比“原生后端”和“8004 wrapper”；原生通过、wrapper 失败，就能直接定位到 wrapper。
 
-已做 5 臂对照实验（thinking × no-offset 两维度），**0/5 合格**。加大 token 无效、关 thinking 无效、降 reasoning_effort 到 low 也无效。证据链完整（manifest/请求/响应/raw/receipt 哈希互锁）。
+## 2. thinking 泄漏：生成模式与响应解析没有正确配合
 
-**最想请教的三个问题（详见 §8）：**
-1. `json_object` 为什么没被服务端强制执行？是自建 wrapper / vLLM 配置的已知坑吗？
-2. thinking 泄漏进 content 字段，是 Qwen3 模板/解析层的已知问题吗？正确关法是什么？
-3. "锚定替换"这种字符级忠实性约束，prompt 工程还能救多少？还是必须换架构（模型只输出 diff / 上受约束解码 guided_json）？
+**证据：**E 开启 thinking，推理正文进入了 `content`，没有被正确分离。
 
----
+**最可能的原因：**未启用匹配的 reasoning parser，或者模板、parser、wrapper 响应拼装不一致。
 
-## 1. 系统背景
+**解决方案：**
 
-HarnessIR 是一个图像修复编排系统。流水线：
+- Rewriter 先使用 **`enable_thinking=False`**，确认它实际传到 tokenizer 的模板渲染。
+- 如果保留 thinking，使用匹配模型和版本的 parser，把 reasoning 与 `content` 分开。
+- 暂停用 `low/xhigh` 调参：**原版 Qwen3-8B 模板并不读取这些 effort 参数**，除非 wrapper 另外实现了映射。[huggingface.co](https://huggingface.co/Qwen/Qwen3-8B/blob/main/tokenizer_config.json?utm_source=chatgpt.com)
 
-```
-LQ 图像 → Planner（VLM 分析，产出需求 IR "plan_d"）
-        → Rewriter（本次问题所在）
-        → 候选生成（CF / CT / CFT 三个 slot）
-        → Judge（J1，交付前拒收）
-        → H3 执行器出图
-```
+你们的 B/D 没有证明“关 thinking 失败”；它们证明的是关闭后仍有格式和业务错误。
 
-Rewriter 输入：planner 产出的 requirements_ir，每条含：
-- `source_span`：P0 原文锚句（**锁定，字符级不许改**）
-- `scope`：作用域（ROI id）；`kind`：`restoration_strategy`（可改）或保护类（identity/expression/layout 等，不可改）
-- `mutable_by`：哪些候选 slot 允许改它（如 `["CF","CFT"]`）；`protected_links`：联动保护
+## 3. 语义失败：接口给了模型过多不必要的写权限
 
-输出合约：一个 JSON 对象，顶层只有 `requirements_ir` 和 `candidates`；candidates 恰好 CF/CT/CFT（不许有 C0 空候选）；每个 replacement 的 `new_text` 必须 = 锚句原文 + 追加文本（锚定替换）；保护类 requirement 原样保留。
+**核心问题：**只需要模型提出恢复策略，却要求它重新输出整个 IR、锚句、`scope`、`mutable_by` 和完整 `new_text`。因此复制错误与权限漂移都可能触发 `protected_requirement_modified`。
 
-**合格判定五道门，全过才算 eligible：**
+**最有效的解决方案：模型只输出 ID 和追加文本。**
 
-| 门 | 检查内容 |
-|---|---|
-| 1. JSON | content 是合法 JSON |
-| 2. Schema | 字段/枚举/结构完全符合合约（平铺，无多余键） |
-| 3. IR | scope/mutable_by 域与 planner 词典对齐 |
-| 4. Raw 提取 | **raw 原文必须恰好等于一个 JSON 对象**——不许围栏、不许前后缀推理文本 |
-| 5. 编译 | replacement 过生产编译器：锚句未改、保护未触碰 |
-
-门 4 是刻意的：要"模型天然输出干净 JSON"的证据，不是事后从垃圾里捞。门 5 是业务安全线：锚句对应图像受保护内容（人脸、文字、布局），改了破坏保真。
-
-## 2. 环境与请求参数
-
-- 模型：`qwen3_8_27b`（Qwen3-8B 系，本地部署）
-- 服务：自建 OpenAI 兼容服务，端口 8004（GPU）；wrapper：`code/RetouchAgent/RefTouch-main/tools/vlm_server_8004.py`
-- 公共参数（5 臂一致）：`temperature=0`，`max_tokens=16384`，`response_format={"type":"json_object"}`；变化的只有 `chat_template_kwargs`（见 §3）
-
-## 3. 失败现场：r2 五臂实验（2026-11-21 13:34 收口）
-
-实验目录：`runs/_smoke/rewriter_thinking_nooffset_ab_20261120_r2/`
-（同一冻结输入，单臂单次注册调用，manifest/请求/响应/raw/receipt 全哈希互锁；结论见 `summary.md` + `decision.json`）
-
-| 臂 | chat_template_kwargs | finish | tokens | 耗时 | 死在哪道门 |
-|---|---|---|---:|---:|---|
-| A0 | `enable_thinking=true, effort=xhigh` | **length** | 16384 耗尽 | 876 s | 门 1：推理写满 16k，正式 JSON 没出场 |
-| B | `enable_thinking=false` | stop | 700 | 39 s | 门 4：raw 被 ```json 围栏包裹；offset 字段与合约不符 |
-| C | `enable_thinking=true, effort=xhigh` | stop | 13648 | 728 s | 门 4：raw 前有推理；候选混入 C0 |
-| D | `enable_thinking=false` | stop | 928 | 51 s | 门 4：提取失败 + 又混入 C0；部分 span 非 P0 原文 |
-| E | `enable_thinking=true, effort=low` | stop | 5495 | 292 s | **最远**：门 2/3 全过，死在门 4（6954 字符推理前缀）+ 门 5（CF/CT/CFT 全部 `protected_requirement_modified`）+ 域不一致 ×4 |
-
-**终态：`no_rewriter_arm_eligible`，0/5。**
-
-### 真实样本（摘自 `v5/arms/*/raw.txt`）
-
-**E 臂 raw 开头（thinking 泄漏，前 6954 字符是推理）：**
-
-```
-The user wants a JSON output with two top-level keys: `requirements_ir` and
-`candidates`. I need to parse the P0 source text into requirements, each
-referencing an exact unique source_span (no start/end offsets). ...
-（…6954 字符推理后才是 JSON；JSON 本身过门 2/3…）
-```
-
-**B 臂 raw 开头（围栏包裹 + 旧版合约串台）：**
-
-````
 ```json
 {
-  "requirements_ir": [
-    {
-      "requirement_id": "req_cf_left_text",
-      "source_span": {"start": 1543, "end": 1913},
-      ...
-```
-````
-
-注意 B 臂把 `source_span` 写成 `{start,end}` 偏移对象——那是**上一版合约**的格式；本版要求锚句字符串、禁偏移。模型在两代合约间串台。
-
-**E 臂编译失败原文（三个 slot 同因）：**
-
-```
-compilation failed for CF:  protected_requirement_modified: Only declared target restoration strategies are mutable
-compilation failed for CT:  protected_requirement_modified: Only declared target restoration strategies are mutable
-compilation failed for CFT: protected_requirement_modified: Only declared target restoration strategies are mutable
+  "requirement_id": "req_face_strategy",
+  "append_text": "仅恢复输入可支持的面部纹理，保持五官轮廓与表情。"
+}
 ```
 
-即模型改写了无权改的需求（或动了锚句本身），而不是"锚句原样 + 追加"。
+代码负责：
 
-## 4. 关键技术发现
-
-1. **`response_format={"type":"json_object"}` 没被服务端强制。** B 臂带 json_object 请求返回围栏，E 臂返回推理+JSON。推测自建 wrapper 只透传，`json_object` 未接到 vLLM guided decoding，或版本不支持。
-2. **thinking 输出位置不可控。** A0 证明 xhigh 会耗尽 token；E 证明 effort=low 仍产出约 7k 字符推理且泄漏进 content。wrapper 解析未把 think 段从 content 剥离（或模板未走独立 reasoning 字段）。
-3. **关 thinking 止损但救不了语义。** B/D 快速 stop（39–51 s）说明 token 预算不是根因；但 raw 仍脏、C0 仍混入、span 仍非原文。
-4. **planner 与 rewriter 词典不对齐。** E 臂 4 条 `Requirement scope and mutable_by domains differ`：模型按 scope 语义面推断可变域，与 planner 声明的 `mutable_by` 不一致——两阶段接口契约问题，非单模型问题。
-5. **同构问题在 J1（judge）阶段出现过**（`HANDOFF_20261119_session_resume.md`）：同一 prompt A 池成功、B 池错结构。属本服务上结构化输出的系统性不稳定，非 rewriter 独有。
-
-## 5. 已尝试并否定的方案
-
-| 方案 | 结果 | 否定原因 |
-|---|---|---|
-| 加大 max_tokens（8k→16k） | A0 仍 length | thinking 无上界，加 token 是无底洞 |
-| 关 thinking（enable_thinking=false） | B/D 快速 stop | raw 仍脏（围栏），C0/span 问题依旧 |
-| 降 reasoning_effort（xhigh→low） | E 臂 | 推理仍泄漏 7k 字符；语义违规全数保留 |
-| format repair 二次调用（J1 做过） | 偶尔成功 | 同 case 内修复链不可靠，不能作生产路径（B 池 primary+repair 双败） |
-| 仅靠 prompt 更强措辞 | 有限 | 合约已写入 prompt，模型仍串台旧格式、仍整句重写 |
-
-**明确不做**：不自动修复 `protected_requirement_modified`——那是真实业务违规（破坏图像保真），自动修等于掩盖事故；宁可判不合格。
-
-## 6. 当前根因假设（待请教确认）
-
-1. **服务层**：自建 wrapper 未实现/未启用 OpenAI `json_object` 语义，也未剥离 Qwen3 reasoning 段。最可疑、可能最低成本修复。
-2. **模板层**：Qwen3 chat template 的 thinking 开关与 `reasoning_effort` 组合行为不符预期（`enable_thinking=false` 仍输出自然语言推理，说明模板可能没被正确应用，或 wrapper 用了通用模板）。
-3. **模型能力层**：8B 模型对字符级锚定替换约束的遵循能力不足，temperature=0 也救不了；只能靠架构绕（§7）。
-
-## 7. 进行中的对策（r3，已立项未跑真枪）
-
-计划：`docs/superpowers/plans/2026-11-21-rewriter-contract-repair-e.md`；
-代码与测试已就绪：`tools/rewriter_contract_repair_e.py` + `tests/test_rewriter_contract_repair_e.py`（root 194 passed 19:03；task2 382 passed 19:28，均真实运行）。
-
-思路：**prompt 显式合约 + 代码侧确定性归一化**：
-- 归一化只修无争议元数据：drop 空 C0、ROI 域名翻译（`left_products` → `text.left_products`）、`mutable_by` 域映射，每步留 receipt；
-- **拒绝修** protected spans / source_span / new_text 实质内容；
-- `json.JSONDecoder().raw_decode()` 在每个 `{` 处尝试提取，并要求第一个恢复出的 dict 与 returned 完全相等（防捞错对象）；
-- 单臂真实 GPU0 E 请求验证，产物进新的不可变 r3 root（尚未执行）。
-
-## 8. 想请教的问题（按优先级）
-
-1. **json_object 失效**：vLLM 自建 OpenAI 兼容层上 `response_format={"type":"json_object"}` 正确接法是什么？是 `guided_json` / `guided_grammar`（受约束解码）吗？我们这个 wrapper 是否明显缺了这一段？
-2. **thinking 泄漏**：Qwen3 系列 non-thinking 模式下 content 仍含推理，是已知问题吗？正确做法是 (a) 模板侧用独立 reasoning 字段并丢弃，(b) 服务端正则剥离，还是 (c) 不该用通用模板？
-3. **受约束解码的边界**：若上 guided_json，"锚句必须逐字保留"这种**跨字段、依赖输入**的约束（新文本必须以给定锚句为前缀）能写进 grammar/schema 吗？有无 EBNF/regex 前缀约束实践？
-4. **架构替代**：让模型只输出"追加文本"或 diff、锚句由代码拼接——你们经验里对字符级忠实性约束这是不是更可靠的通解？
-5. **模型规模**：8B 量级做"结构+语义双合约"任务的成功率预期是多少？换更大模型 vs 换架构，哪个先做？
-
-## 9. 复现方式
-
-```bash
-cd HarnessIR/HarnessIR-main
-# 每臂 request.json / response.json / raw.txt / receipt.json：
-ls runs/_smoke/rewriter_thinking_nooffset_ab_20261120_r2/v5/arms/{A0,B,C,D,E}/
-cat runs/_smoke/rewriter_thinking_nooffset_ab_20261120_r2/summary.md      # 终态判定
-cat runs/_smoke/rewriter_thinking_nooffset_ab_20261120_r2/v5/results.jsonl  # 逐臂门禁结果
+```python
+new_text = frozen_ir[requirement_id].source_span + separator + append_text
 ```
 
-复跑脚本：`tools/rewriter_thinking_nooffset_ab.py`（冻结 manifest 校验 + 单臂注册调用 + 五门判定）。服务：8004 端口 qwen3_8_27b。
+同时：
 
-## 10. 证据索引（不可变归档，请勿修改）
+- 原始 IR、锚句、`mutable_by` 全部冻结，由代码读取；
+- 每个 slot 只能选择允许的 requirement ID；
+- 保留原编译器检查；
+- J1 检查追加内容是否与保护要求冲突。
 
-| 路径 | 内容 |
-|---|---|
-| `runs/_smoke/rewriter_thinking_nooffset_ab_20261120_r2/summary.md` | r2 终态报告（2026-11-21 13:34） |
-| `.../decision.json` | 冻结判定 `no_rewriter_arm_eligible` |
-| `.../v5/results.jsonl` | 逐臂五门状态与错误列表 |
-| `.../v5/arms/{A0,B,C,D,E}/` | 每臂 request/response/raw/receipt + 哈希 |
-| `docs/four_candidate_generation_root_cause_20261120.md` | 前置根因分析 |
-| `docs/rewriter_ab_poteto_review_20261120.md` | r2 实验独立评审 |
-| `docs/qwen_enable_thinking_mechanism_review_20261120.md` | thinking 机制调研 |
-| `HANDOFF_20261119_session_resume.md` | J1 阶段同类问题背景 |
-| `docs/H3_T6_EXPERIMENT_REPORT_20261119.md` | T6 报告（J1 A/B 池对照） |
+**这项修改能从构造方式上保证原文保留，比让模型逐字复述更可靠。**
 
+## 建议执行顺序
+
+1. **先修 8004：**确认 non-thinking 和 JSON Schema 约束真实生效。
+2. **再改 Rewriter：**只生成 `requirement_id + append_text`，代码拼接并检查权限。
+3. **最后评估更大模型：**用于改善策略质量和冲突判断。
+
+**r3 的 JSON 提取可以用于诊断，但不能算原始 JSON 合格；`mutable_by` 也不应通过推断来“修正”。当前优先级最高的是服务接线和接口收缩，继续增加 token 或强化 prompt 的收益较低。**
