@@ -1,249 +1,781 @@
-# 导师讨论稿：AutoHarness——面向可靠图像恢复的系统优化
+# RefTouch-main-v2 项目流程与语义分割作用梳理
 
-**建议讨论的核心不是“为不同模型写不同 Prompt”，而是：如何让恢复行为同时匹配输入证据、任务要求和模型能力，使系统获得真实、可接受的恢复收益。**
 
-其中，**可靠图像恢复是研究目标，模型适配与 Harness 自动优化是拟验证的技术路线；H3 的纹理增强导致颜色、亮度漂移，是切入案例，不是整个课题的边界。** 这也与此前任务级重构一致：应从恢复任务出发，再判断需要什么模型与系统机制。AutoHarness_Task_Level_Reframin…
 
----
+## 1. 范围与核心结论
 
-## 一、项目背景：我们为什么研究这个问题？
+本文回答四个问题：
 
-### 1. 最初目标：通过系统设计提高现有模型的恢复能力
+1. 整个项目如何从输入图像走到最终候选与评价结果。
+2. 语义分割在生成、评分和选择中分别起什么作用。
+3. 当前实际采用的分割实现是什么，存在哪些问题。
+4. 已提出的统一分割设想能解决什么，不能解决什么。
 
-我们希望在不训练底层模型、优先使用可部署模型的条件下，通过诊断、证据组织、规划、执行和验证，提高真实图像恢复的效果。已有 HarnessIR 是实验基础，但不要求必须保留其全部架构。第一阶段的重点是找到**能够被系统方法弥补的能力缺口**，而不是先做一个复杂的自进化平台。HarnessIR_系统级能力增强_研究需求与专家工作流
+核心结论如下。
 
-当前基本流程是：
+- 项目不是“训练一个分割模型”，也不是“让 VLM 修图”。项目使用 A/B 区域统计构造显式修图计划，从 A 确定性生成 12 个候选，再由 Code、VLM 或两者组合选择结果。
+- 语义分割同时影响编辑目标、实际编辑范围、数值评分和部分 VLM 输入。分割错误会穿过整个流程，不是独立的可视化问题。
+- 当前生成侧并不只使用 `face/body/hair/clothing`。基础编辑仍依赖 `skin/background`，v0.5.x 又加入 face/body 亮度精修和 clothing 编辑。
+- 当前采用实验基线是 v0.5.2 与 `config_v052_gate.json`。`run.py` 默认读取 `config.json`，复现采用基线时必须显式传配置。
+- 普通 `run.py` 的 Semantic Code/VLM/Hybrid 流程与 `--listwise-only` 的 Legacy Top4/V0/V1/V2 流程是两条不同链路。
+- 已实现的 `skin_luma_refine_mode="unified"` 是脸和身体皮肤的统一亮度精修，不是统一语义分割。
+- 统一分割目前只是未实施设计草稿。它可以改善 mask 的结构与语义管理，但不能替代编辑算子、评价体系和人工视觉验收。
 
-**退化图像 → Diagnosis → 工具取证 → Composition → 生成模型执行 → Verification / 候选选择。**
+## 2. 项目目标与交付物
 
-这条路线能够把恢复需求表达得更清楚，但仍存在一个关键问题：**系统知道应该改什么，不等于执行器能按照要求完成修改。**
+### 2.1 项目要解决的问题
 
-### 2. 直接触发问题：H3 的 texture-only 失败
+项目研究的问题是：给定待编辑图 A 和参考图 B，能否使用区域级颜色与亮度统计，以可控的数值参数生成接近 B 的结果，并从固定候选池中选出一个合适结果。
 
-在当前实验中，任务要求只改善纹理，但观察到：
+研究动机不是让模型自行理解并执行任意修图指令，而是解决两个具体问题：
 
-| 环节 | 当前观察 |
-|---|---|
-| 任务要求 | 改善纹理，保持原有颜色和影调 |
-| Prompt | 已包含 `keep tone exactly` 等保护要求 |
-| 生成结果 | 纹理变化同时伴随颜色、亮度变化，部分阴影被压暗或截断 |
-| 当前后处理 | 未能同时保留纹理收益并消除上述损伤 |
+- 生成式编辑的调整幅度可能过大或过小。
+- 不同语义区域可能被错误耦合，例如皮肤调整影响衣服或背景。
 
-这个现象支持的判断是：
+项目把问题拆成两部分：
 
-> **自然语言中的保护要求，尚未被当前执行链路可靠落实。**
-
-但它还不能直接证明“所有失败都来自 H3 不听话”，也不能证明“换一套 Harness 必然有效”。后续需要区分：输入信息不足、证据没有提取出来、执行没有遵循证据，以及候选选择错误。
-
-### 3. 从个别失败上升到任务需求
-
-图像恢复需要同时满足三个目标：
-
-**视觉改善：** 内容更清晰、噪声和伪影更少。
-
-**内容正确：** 人物身份、文字、结构和空间关系仍对应原场景。
-
-**生成程度与证据相称：** 有依据的内容应充分恢复；无法可靠判断的内容，不应被系统包装成已经恢复出的事实。AutoHarness_Task_Level_Reframin…
-
-因此，**“生成得更好看”与“恢复得更正确”并不等价。** 我们要研究的是二者之间可被系统改进的部分，而不是简单抑制生成。
-
----
-
-## 二、研究问题：究竟要解决什么？
-
-### 总体研究问题
-
-> **面对真实退化图像，系统能否充分利用仍然存在的有效线索，恢复有用内容，同时减少无依据的内容改写和非目标属性损伤？**
-
-### 当前阶段的可检验问题
-
-> **在固定基础模型和计算预算的条件下，依据任务约束与模型实际行为适配 Prompt、Evidence 和执行方式，能否比共享流程、Prompt-only 优化及等预算多次采样，获得更高的有效恢复成功率？**
-
-这里的“有效恢复成功”是：
-
-\[
-\text{有效恢复成功}
-=
-\text{目标确实改善}
-\;\land\;
-\text{关键约束满足}
-\]
-
-始终返回原图虽然可以避免新增损伤，但不能计为恢复成功；输出更锐利但改写文字、压死阴影，也不能计为成功。
-
-### 需要先定位的四类失败
-
-| 失败类型 | 具体含义 | 对应的改进方向 |
+| 研究问题 | 含义 | 判断依据 |
 |---|---|---|
-| **信息不足** | 当前观测无法可靠区分目标内容 | 限制无依据的确定化，不把猜测当事实 |
-| **证据提取不足** | 有效线索仍在，但系统没有识别或利用 | 改进诊断、ROI 和证据表达 |
-| **执行失效** | 已有正确目标或依据，生成结果仍偏离 | 改进条件组织、执行控制或执行器选择 |
-| **选择失效** | 候选池中有好结果，但 Judge 选错 | 改进比较、验收和反馈 |
+| Candidate Coverage | 12 个候选中是否至少有一个可接受结果 | 人工最佳或可接受候选、全图与区域视觉检查 |
+| Selection Accuracy | Code、VLM、Hybrid 是否选中了合格候选 | 选择 ID 与人工 Oracle 或可接受集合的比较 |
+| 与 Qwen 的辅助比较 | 确定性结果是否优于已有生成式结果 | 仅比较已有 `qwen.png`，不新增 Qwen 推理 |
 
-**这四类是诊断框架，不是已经得到的实验结论。** 后续方法应由主要瓶颈决定，而不是先假设所有问题都能通过更好的 Prompt 或更多 Agent 解决。AutoHarness_Task_Level_Reframin…
+数值误差下降只是证据之一，不能单独证明视觉质量提高。
 
----
+### 2.2 项目不做什么
 
-## 三、与 HarnessIR、AutoRef 的关系及潜在差异
+当前主项目不执行以下任务：
 
-根据此前文献梳理，HarnessIR 已覆盖诊断、取证、指令组织与验证；AutoRef、Meta-Harness 已覆盖冻结模型之外的 Harness 程序优化及部分迁移实验。因此，“增加多候选”“自动修改代码”“针对模型适配”本身不足以构成新的研究主张。AutoHarness_5_Research_Directio…
+- 不训练图像生成模型。
+- 不让 VLM 直接生成候选图。
+- 不对非配准 A/B 使用逐像素 PSNR 或 SSIM 判断参考风格。
+- 不进行无限候选迭代或自动搜索。
+- 不把区域 Lab 改善直接等同于人工视觉通过。
+- 不把 V3 phase1 实验视为当前树的采用版本。
 
-| 对照 | 已有研究重点 | 我们进一步关注的问题 |
+README 仍明确把当前系统称为研究实验，而不是已经验证的生产修图系统。
+
+### 2.3 完整交付物
+
+项目交付不只是一张 Best 图。完整结果包括：
+
+- 输入 case 与 A/B 双侧 mask。
+- 诊断 `01_diagnosis`。
+- 修图计划 `02_plan`。
+- 12 个候选、参数和 contact sheet。
+- Legacy 或 Semantic 数值评价。
+- Code Best、VLM Best、Hybrid Best，或独立 listwise 的 V0/V1/V2 结果。
+- VLM 原始响应、状态和错误记录。
+- 最终对比图、ROI、报告与批量汇总。
+- 人工 Oracle、Acceptable IDs 和视觉评审记录。
+- 冻结实验所需的候选、Top4、输入和配置哈希。
+
+## 3. 输入数据与 case 准备
+
+### 3.1 单 case 输入
+
+普通运行读取一个 case 目录。核心输入为：
+
+```text
+A.png                         待编辑图
+B.png                         参考图
+skin_mask.png                 A 基础皮肤区域
+background_mask.png           A 基础背景区域
+skin_mask_B.png               B 独立皮肤区域
+background_mask_B.png         B 独立背景区域
+face_skin_mask.png/_B.png     脸部皮肤
+body_skin_mask.png/_B.png     当前含义为 body + neck
+hair_mask.png/_B.png          头发
+clothing_mask.png/_B.png      衣服
+white_clothing_mask*.png      可选中性衣服视图
+colored_clothing_mask*.png    可选彩色衣服视图
+qwen.png                      可选历史生成式结果
+```
+
+A 与候选 C 对齐。A 与 B 不要求像素对齐，也不要求分辨率相同。
+
+### 3.2 A/B 非配准契约
+
+A/B 的对应区域分别统计：
+
+```text
+stats(A, A_side_mask) + stats(B, B_side_mask) → 区域目标差
+```
+
+B 的 mask 用于提取参考统计，不直接投影到 A 上执行编辑。
+
+基础 `skin/background` 存在兼容回退。B mask 缺失时，旧加载器可以缩放 A mask 作为粗略代理并给出警告。这个代理不是像素配准，也不是真实 B 分割。
+
+Semantic 评价不接受这种替代。缺少任一侧匹配区域时，对应区域记为 N/A，不记零误差。
+
+### 3.3 NewBinary 212 组数据
+
+nb212 全量测试使用：
+
+- A：`pred_baseline_aitone`。
+- B：`iphone/GT`。
+- 映射：train 191 对，test 21 对，共 212 对。
+- 输入 A 目录另有 40 张 pred 没有 GT 映射，按协议排除。
+
+`code/RetouchAgent/RefTouch-main/RefTouch-main-v2/tools/prepare_newbinary_cases.py` 负责把图像对准备成 case，并生成基础与语义 mask。
+
+### 3.4 当前数据与历史 nb212 输出不是同一时点
+
+本轮实测得到：
+
+- 212 张 nb212 `C00.png` 的 mtime 范围是 2026-11-15 至 2026-11-17。
+- 当前 `data_nb` 和 `data_nbtrain` 的 `body_skin_mask.png` 都在 2026-11-19 被重写。
+- 当前 212 个数据 case 的 `semantic_masks_report.json` 都包含 `neck_b1_px`。
+- 普通 nb212 输出中没有 `fixed_candidates.json`。
+
+因此，当前数据目录不能用于反推 nb212 候选生成时的原始 mask 字节。当前报告含 B1 字段，也不能证明历史 nb212 候选使用了今天的 B1 mask。
+
+普通 `summary.json` 不是完整的输入哈希快照。历史候选的精确复现需要当时的代码、配置、输入和 mask 哈希，不能只靠今天的数据目录。
+
+## 4. 普通主流程总览
+
+普通 `run.py` 的实际主链为：
+
+```text
+A/B 图像与双侧 mask
+    ↓
+load_case：读取输入、检查 mask、形成统计 mask 与 A 侧编辑权重
+    ↓
+diagnose：计算 skin/background/clothing/global 的 A/B 区域统计
+    ↓
+build_plan：生成 global、skin、background、clothing、skin refine 数值计划
+    ↓
+candidate_parameters：展开固定 C00…C11 参数组合
+    ↓
+apply_plan：每个候选都从原始 A 独立渲染
+    ↓
+Semantic 评价全部候选
+    ├── Code Best：Semantic 总榜第一
+    └── Code Top4：综合第一与专项候选的多样化组合
+    ↓
+VLM 全量 Code-blind 评价 → VLM Best
+    ↓
+VLM 复评 Code Top4 + Code evidence → Hybrid Best
+    ↓
+最终对比图、报告和 summary.json
+```
+
+VLM 不参与候选像素生成。默认 `vlm_can_disable_operators=false`，VLM 也不控制算子启停。
+
+## 5. 从输入到候选图
+
+### 5.1 `load_case`
+
+`code/RetouchAgent/RefTouch-main/RefTouch-main-v2/run.py` 的 `load_case` 读取 A/B 和 mask，并返回两组对象：
+
+- `am/bm`：A/B 原始统计 mask。
+- `edit_masks`：A 侧用于实际编辑的 mask，可按配置羽化或软化。
+
+基础 A 侧 `skin/background` 是强制输入。衣服、face/body refine 和 soft mask 路径按配置加载。
+
+缺失或过小区域采用不同的降级方式：
+
+- clothing A mask 不可用时，不编辑衣服。
+- clothing B mask 不可用时，没有成对衣服统计和 clothing plan。
+- face/body 任一侧不可用时，跳过相应 refine 区域。
+- 基础 B skin/background 可按旧兼容配置使用粗略 A mask 代理。
+
+### 5.2 `diagnose`
+
+基础诊断计算成对可用的 `skin/background/clothing`，以及 `global`。每个区域记录 A、B 和 `delta_B_minus_A`。
+
+统计项包括：
+
+- L 均值与 P10/P50/P90。
+- a*、b* 均值。
+- chroma 均值。
+
+`face_skin` 和 `body_skin` 不进入这一基础诊断表。它们在后续 `build_plan` 中直接用于 unified skin refine，所以只看 `01_diagnosis` 不能完整解释最后的皮肤亮度计划。
+
+### 5.3 `build_plan`
+
+修图计划由以下部分组成。
+
+| 计划项 | 目标来源 | 当前作用 |
 |---|---|---|
-| **HarnessIR** | 利用诊断、证据和指令组织，让通用模型完成恢复 | 目标表达正确后，哪些操作实际可执行？失败是否需要改变执行方式？ |
-| **AutoRef** | 优化多参考生成的条件组织、候选生成、检查和选择 | 如何将优化目标改为受观测证据和保真要求约束的恢复收益？ |
-| **通用 Harness 优化** | 自动搜索更有效的程序与工作流 | 如何防止搜索放大 Judge 偏好，获得高分却损伤真实内容？ |
-| **模型专属适配** | 根据模型特性调整输入和调用方式 | 哪些机制可以共享，哪些确实存在 Model × Harness 交互？ |
+| `tone_curve` | A/B 全图 L 的 P10/P50/P90 | 构造全图 L 映射 |
+| `skin` | 基础 skin 的 A/B 均值 | a/b 偏移，以及 global 后的 L 残差 |
+| `background` | 基础 background 的 A/B a/b 均值 | 只提供 a/b 偏移，没有独立背景 L 算子 |
+| `clothing` | A/B 衣服颜色分布 | v0.5.2 使用 a/b 分位曲线和主簇门控 |
+| `skin_luma_refine` | B 的 face/body L 分布 | unified 模式使用同一组七分位目标 |
 
-### 为什么不能直接照搬图像生成方案？
+skin 的 L 残差按 full-strength global 后的 A 状态计算。它不会针对每个候选的不同 global 强度重新估计。
 
-多参考生成主要解决：**让多个条件同时成立，并形成自然的新图像。**
+### 5.4 v0.5.2 的实际启用路径
 
-恢复还要解决：**输入既包含应保留的信息，也包含应消除的退化；系统必须判断哪些变化是恢复，哪些变化是破坏。**
+`code/RetouchAgent/RefTouch-main/RefTouch-main-v2/config_v052_gate.json` 开启：
 
-例如，统一光照可能改善生成图的自然度，但在 texture-only 中可能违反影调保持要求。同样，合理补全一个模糊招牌，在生成任务中可能可以接受，在恢复任务中却可能改变实际字符。
+```text
+clothing_region
+clothing_distribution_match
+clothing_curve_cluster_gate
+skin_luma_refine
+skin_luma_refine_mode = unified
+```
 
-**潜在贡献应落在“恢复决策如何受证据与约束控制”，而不是简单地把 AutoRef 换成一个 IR 数据集。**
+该配置未开启 `soft_skin_v1` 或 `bg_atten_v1`。
 
----
+`run.py` 默认配置是 `config.json`。因此，以下命令才明确表示使用当前采用实验配置：
 
-## 四、我们提出的方案：共享任务标准，适配执行策略，独立评测
+```bash
+python code/RetouchAgent/RefTouch-main/RefTouch-main-v2/run.py \
+  --data <case_dir> \
+  --out <new_output_dir> \
+  --config code/RetouchAgent/RefTouch-main/RefTouch-main-v2/config_v052_gate.json
+```
 
-### 1. 总体架构：内层恢复，外层优化
+该命令会写输出。对已有实验复验时应使用新目录，不能覆盖历史结果。
 
-**内层：处理一张图像。**
+### 5.5 主编辑算子
 
-**任务定义 → 诊断与取证 → 能力匹配和恢复计划 → 候选执行 → 独立验收 → 交付或未解决。**
+`code/RetouchAgent/RefTouch-main/RefTouch-main-v2/editor.py` 的 `apply_plan` 按顺序执行：
 
-**外层：优化一套恢复策略。**
+1. 全图 global L 曲线。
+2. 基础 skin 的 L/a/b 调整。
+3. 基础 background 的 a/b 调整。
+4. clothing 的 a/b 分位曲线或常量回退。
+5. 末尾 face/body unified L refine。
 
-**读取历史与失败证据 → 提出机制假设 → 修改 Harness → 固定协议评测 → 隐藏集选优 → 保留有效版本。**
+基础 skin、background、clothing 的权重按 `max(1, 权重和)` 归一化，以控制重叠区域的叠加。
 
-需要区分：**内层候选是图像，外层候选是 Harness 程序。** 最终提升究竟来自更好的生成，还是更好的选择，要分别验证。
+clothing 主簇门控限制曲线作用范围。门外像素不执行 clothing 改色，避免配饰或离群颜色主导整件衣服的变化。
 
-### 2. 拟重点改善的四个部分
+### 5.6 Unified skin refine
 
-| 模块 | 拟议改善 | 预期解决的问题 |
+当前 unified refine 的过程为：
+
+1. 在 B 的 `face_skin ∪ body_skin` 上提取 L 的 5/10/25/50/75/90/95 分位目标。
+2. 在当前 A 候选的相同并集上提取源分位。
+3. 构造一条 L 曲线。
+4. 在并集范围内应用曲线。
+
+它作用于全部候选，不是第五个强度轴。
+
+因此，C00 只表示 global、skin、background、clothing 四个主强度为零。启用 refine 后，C00 仍可能改变图像，不一定是严格 no-op。
+
+### 5.7 固定候选网格
+
+候选是手工固定的 12 组强度组合，不是完整笛卡尔积，也不是随机搜索。
+
+有 clothing plan 和 A 侧编辑 mask 时使用四轴 `(G,S,B,C)`。否则回退三轴 `(G,S,B)`。
+
+每个候选都从原始 A 独立渲染。候选之间不串联编辑结果。
+
+## 6. 普通评价与选择流程
+
+### 6.1 Semantic 评价
+
+`code/RetouchAgent/RefTouch-main/RefTouch-main-v2/semantic_eval.py` 对全部 12 个候选计算：
+
+- 区域 a/b 分位颜色误差。
+- 区域 L 分位亮度误差。
+- 动态范围与局部对比度误差。
+- 白衣中性色误差。
+- 区域间亮度或颜色关系。
+- 全图 tone 和 clipping。
+- A/C 结构保持指标。
+
+区域包括 face、body、hair、white/colored clothing、background。缺少匹配 A/B mask 的区域退出加权，不记零误差。
+
+Semantic 排名是启发式数值指标，不是经过验证的人类感知真值。
+
+### 6.2 Code Best 与 Code Top4
+
+普通主链的 Code Best 是 Semantic 综合排名第一。
+
+Code Top4 不一定是原始总榜前四名。选择过程先保留综合第一，再加入 face color、white neutral、global tone 等专项候选，去重后按规则补足四名。
+
+### 6.3 VLM Best
+
+VLM Best 来自全量 12 候选的 Code-blind listwise 调用：
+
+- 输入 A、B、候选 contact sheet 和可用 ROI。
+- 不提供 Code 分数或 Top4。
+- 输出独立选择。
+
+Code-blind 只表示隐藏 Code 评价，不表示没有语义区域图。
+
+### 6.4 Hybrid Best
+
+Hybrid 使用第二次 VLM 调用：
+
+- 候选范围仅为 Code Top4。
+- 输入 Top4 图像、ROI 和 Code evidence。
+- VLM 重新比较并选择，不直接沿用全量 VLM Best。
+
+VLM 不可用或响应无效时，对应 Best 为 `null`。Code Best 不会自动顶替缺失的 VLM 或 Hybrid。
+
+### 6.5 普通输出
+
+普通 case 的主要输出包括：
+
+```text
+01_diagnosis.json / 01_diagnosis.png
+02_plan.json / 02_plan.png
+03_candidates/C00.png … C11.png
+03_candidates/candidates.json
+03_candidates/contact_sheet.png
+04_semantic_scores.json / 04_semantic_scores.csv
+05_vlm_result.json
+06_final_comparison.png
+result.md
+```
+
+普通批量 `summary.json` 是数组，每项核心字段为：
+
+```text
+case
+code_best
+vlm_best
+hybrid_best
+code_gain
+vlm_status
+```
+
+`code_best` 和 `code_gain` 在普通主链中使用 Semantic 口径。`vlm_status` 表示全量 Code-blind 调用状态，Hybrid 详细状态另见 `05_vlm_result.json`。
+
+## 7. 独立的 frozen-listwise 流程
+
+### 7.1 两条链不能混为一谈
+
+`--listwise-only` 在 `run.py` 入口直接分流，不执行普通 `run_case`。
+
+```text
+已有 C00…C11
+    ↓
+Legacy mean-Lab 排名
+    ↓
+冻结 Legacy 原始 Top4
+    ↓
+V0 / V1 / V2 三种 VLM 输入协议
+    ↓
+listwise_summary.json
+```
+
+该链路不重新生成候选，不产生普通 `hybrid_best`，也不调用普通 `final_outputs`。
+
+### 7.2 Legacy 与 Semantic 的区别
+
+Legacy 使用基础 `skin/background/global` 的区域均值误差。默认区域权重为：
+
+```text
+skin 0.45
+background 0.35
+global 0.20
+```
+
+Semantic 使用更多语义区域、分位数、对比度、区域关系和结构保持。
+
+在 frozen-listwise 中，两种排名都可以记录，但共享 Top4 固定为 Legacy 原始前四名。Semantic 不替换这个 Top4。
+
+Legacy 公式与早期 build_plan 的目标统计高度同构。NewBinary 21 组曾出现全部选择同一全强度候选的结构性退化，因此 Legacy 排名不能单独代表视觉质量。
+
+### 7.3 V0、V1、V2
+
+| 模式 | 图像输入 | Code 信息 |
 |---|---|---|
-| **任务契约** | 明确目标属性、保护属性、允许变化范围和验收条件 | 避免“更清晰”掩盖非目标损伤 |
-| **证据组织** | 区分输入支持的事实、模糊信息和无法确认的内容 | 避免把模型推测直接变成恢复指令 |
-| **模型适配与执行** | 根据实测行为调整 Prompt、Evidence、候选策略；必要时改变输出使用方式 | 解决共享流程与模型控制能力不匹配 |
-| **评价与搜索反馈** | 分离内部选图和外部验收，记录失败位置与回退原因 | 避免优化器追随错误评分，或反复修改无关模块 |
+| V0 | A、B、Legacy Top4 contact sheet | 无 Verification Record |
+| V1 | A、B、四张独立候选图与 ROI | 无 Verification Record |
+| V2 | 与 V1 相同的图像数组 | 增加 Semantic Verification Record 和专用 prompt |
 
-### 3. H3 texture-only 的具体落点
+V2 是普通 Hybrid 之外的受控评价实验。二者不能仅凭“都使用 Code evidence”就合并解释。
 
-先验证三种可能，而不是预设答案：
+### 7.4 冻结保护
 
-**可能一：现有执行方式能产生合格结果，只是采样和选择不足。**  
-对应改进是更有针对性的候选与 Judge。
+`fixed_candidates.json` 记录候选 PNG 哈希、Legacy Top4、完整排名，以及 A/B、现存 mask、配置和有效 VLM endpoint 的快照。
 
-**可能二：Prompt 或证据组织不适合 H3。**  
-对应改进是模型专属条件编译与证据适配。
+重跑时发现候选、Top4、输入或配置变化，会拒绝覆盖。
 
-**可能三：生成纹理与改写影调存在稳定耦合。**  
-对应实验是让 H3 只提供细节候选，采用受控融合或其他执行方式形成最终结果。
+这层保护属于应用层一致性检查，不是文件系统只读锁。普通 `run.py` 流程也不会自动为每个 case 生成相同的冻结记录。
 
-第三种方式仍要验证：**保住低频亮度与颜色，不等于新增纹理真实。** 若只是调好的颜色匹配或频率回填就能解决问题，应把它保留为工程基线，不强行包装成新的方法贡献。此前方案也明确要求与充分调参的简单后处理比较。AutoHarness_5_Research_Directio…
+## 8. 版本演进与当前基线
 
-此外，“保持颜色与亮度”只适用于当前 texture-only 条件，不能直接推广到本来需要改变影调的低照增强、去雾等任务。
+当前主版本线如下：
 
----
+| 版本 | 改动 | 对整体流程的影响 |
+|---|---|---|
+| v0.1 | skin/background/global 三轴与固定候选 | 建立确定性生成和 Legacy 评价 |
+| v0.2 | SCHP 语义 mask 与 Semantic 评价 | 扩展评价区域，引入 frozen-listwise |
+| v0.3 | clothing 第四轴 | 衣服进入生成目标和候选强度组合 |
+| v0.3.1 | clothing a/b 分位曲线 | 减少均值平移导致的暗部过冲 |
+| v0.5 | face/body L refine | 皮肤亮度在末尾进一步精修 |
+| v0.5.1 | face/body unified L refine | 减少脸与颈部交界的不连续 |
+| v0.5.2 | clothing 主簇门控 | 减少配饰污染衣服曲线和局部翻色 |
 
-## 五、改进计划：先验证瓶颈，再开展自动搜索
+当前采用实验配置是 v0.5.2。版本演进主要围绕生成目标和候选覆盖，评价侧则提供数值对照与选择实验。
 
-### 阶段一：建立可信的问题分析与评价
+兄弟目录 `code/RetouchAgent/RefTouch-main/RefTouch-main-v2-phase1` 的 V3 评价实验不属于当前树，不能并入当前流程图。
 
-第一步不是让 Coding Agent 自动改代码，而是整理一个包含暗部、肤色、织物、文字和细结构的分析集，保存：
+## 9. 语义分割在项目中的作用
 
-**原始输入、诊断证据、实际 Prompt、模型原始输出、后处理输出、候选选择及验收结果。**
+### 9.1 总体作用
 
-先在固定候选池上确认评价器能否识别已知失败，尤其是“纹理改善但影调损伤”“外观自然但内容改写”“没有损伤但也没有改善”。
+语义分割承担四类职责：
 
-**阶段产出：** 失败分类、可接受边界、固定评测协议，以及主要瓶颈的初步证据。
+1. 定义 A/B 的统计区域，决定参考目标如何计算。
+2. 定义 A 的编辑支持域，决定哪些像素被哪些算子修改。
+3. 定义数值评价区域，影响 Code 排名与 Top4。
+4. 提供部分 VLM ROI 和诊断图，影响人工或模型看到的局部证据。
 
-### 阶段二：验证系统干预是否真的有效
+因此，mask 同时处于生成和评价两侧。相同或相关的 mask 错误可能同时影响候选与评分，数值指标不一定能独立发现这种错误。
 
-建议保留以下对照：
+### 9.2 各 mask 的真实消费者
 
-| 对照组 | 回答的问题 |
+| Mask | 目标统计 | 实际编辑 | 数值评价 | 其他用途 |
+|---|---|---|---|---|
+| `skin` | 基础 L/a/b 目标 | 基础 skin L/a/b | Legacy skin | 基础诊断、最终 ROI |
+| `background` | 基础 a/b 目标 | 基础 background a/b | Legacy 与 Semantic background | 基础诊断、VLM/最终 ROI |
+| `face_skin` | unified refine 的 B 侧 L 分位 | 末尾 unified L refine | Semantic face、区域关系 | VLM ROI、脸部诊断工具 |
+| `body_skin` | unified refine 的 B 侧 L 分位 | 末尾 unified L refine | Semantic body、face-body 关系 | 颈部增量与汇总诊断 |
+| `hair` | 不形成当前编辑目标 | 当前不直接编辑 hair | Semantic hair、face-hair 关系 | neck 排除区域 |
+| `clothing` | 衣服 a/b 分布与主簇 | clothing 第四轴 a/b | generic clothing 回退区域 | white/colored 派生 |
+| `white_clothing` | 不直接形成主编辑目标 | 不单独形成编辑轴 | Semantic white、VLM ROI | 中性衣服诊断 |
+| `colored_clothing` | 不直接形成主编辑目标 | 不单独形成编辑轴 | Semantic colored | 彩色衣服诊断 |
+
+### 9.3 不依赖语义 mask 的部分
+
+以下步骤本身不需要语义分割：
+
+- global 全图统计与 L 曲线。
+- global 全图 L 应用。
+- 固定候选网格展开。
+- 文件写出和 contact sheet 生成。
+
+但标准 case 仍强制需要基础 skin/background。其他 plan 数值也可能已经由 mask 推导，所以不能据此认为整个流程可以脱离 mask。
+
+### 9.4 缺失区域对评价可比性的影响
+
+Semantic 对缺失区域记 N/A，并在剩余可用区域间归一化权重。这样可以避免把缺失误记为零误差，但也意味着不同 case 的总分可能由不同区域组合构成。
+
+因此，跨 case 比较 `overall_semantic_error` 或 gain 时，需要同时查看可用区域和 mask caveats。只有总分不能说明评价覆盖是否一致。
+
+## 10. 当前采用的语义分割实现
+
+### 10.1 SCHP-LIP 基础分割
+
+当前主模型是 SCHP-LIP ResNet101，输出 20 类 parsing。A/B 两侧分别推理。
+
+当前映射为：
+
+| 输出 | 来源 |
 |---|---|
-| **当前 Harness / 原始执行** | 基线表现是什么？ |
-| **等预算重复采样 + 同一 Judge** | 改善是否仅来自多生成几张？ |
-| **Prompt / Evidence 适配** | 只改善信息组织，能解决多少问题？ |
-| **人工固定的受控执行策略** | 新执行方式本身是否已经解释主要收益？ |
-| **同一动作空间内的自适应策略** | 根据证据和模型行为作决策，是否带来额外价值？ |
+| `face_skin` | `Face` |
+| `body_skin` 基础部分 | 左右 arm、左右 leg |
+| `hair` | `Hair` |
+| `clothing` | Upper-clothes、Dress、Coat、Pants、Jumpsuits、Scarf、Skirt、Socks |
 
-在两个执行器上进行交叉验证，而不是只比较“H3 + H3 专属方案”和“Qwen + Qwen 专属方案”。这样才能判断收益来自**通用改进**还是**模型特异性适配**。
+SCHP-LIP 没有独立 neck 类。当前代码也没有独立耳朵找回适配器。
 
-重点记录三个层次：
+### 10.2 基础 skin/background 的派生
 
-**候选覆盖：** 池中是否存在“有改善且合格”的结果？
+NewBinary 准备链使用：
 
-**选择能力：** 有合格结果时，系统是否选中了它？
+```text
+skin = SCHP face ∪ SCHP limbs ∪ add_skin ∪ pocket_skin
+body_skin = SCHP limbs ∪ add_skin
+```
 
-**最终效果：** 有效恢复率、重大违例率、回退率、纹理/内容收益及计算成本。
+`add_skin` 是旧版颈部找回。`pocket_skin` 是邻近皮肤且不触边的 SCHP Background 连通口袋。
 
-有 GT 数据用于核查内容与细节正确性，真实无 GT 图像用于检验实际退化和部署表现；两类证据分别报告。
+所以当前 `skin_mask` 不能普遍简化为 `face_skin ∪ body_skin`。
 
-### 阶段三：接入受控的 Harness 自动优化
+### 10.3 旧版 `neck_addition`
 
-在前两阶段确认“评价可信、搜索空间中存在有效改进”之后，再引入外层 Proposer。
+旧版规则从 SCHP Background 中找回满足以下条件的候选：
 
-当前工程路线可以采用：
+- 位于脸框底以下的几何带。
+- a/b 与脸部均值接近。
+- 连通块触及几何带上缘。
+- 连通块面积小于全图 10%。
 
-**VS Code 中可用的 Coding Agent → 文件交接 → Python 搜索控制器 → 独立评测。**
+找回结果并入 `body_skin`，NewBinary 准备链也把它并入 `skin`。
 
-模型调用仍走获准的插件路径，不需要反向代理。外层 Agent 可修改白名单内的 Prompt、证据组织和执行策略；**测试集、约束阈值、外部评分规则及预算不能由它修改。**
+### 10.4 可选 OneFormer B1
 
-自动优化需要与人工固定策略、Prompt-only 搜索进行对比。如果主要收益完全由一个简单算子提供，就不应把自动搜索作为核心贡献。
+B1 由 `--neck-b1` 开启，CLI 默认关闭。OneFormer ADE20K 提供 `person` 候选，后续再经过占用排除、脸部 Lab 分布门、skin 邻接和面积门。
 
----
+B1 结果仍并入 `body_skin`。批量派生脚本用新旧 body 的差集得到新增 neck，再同步到 skin 和 background。
 
-## 六、当前进展与证据状态
+当前 212 个数据 case 的报告都含 `neck_b1_px`，说明相应批次执行过某种 B1 路径。字段本身不能区分全部历史版本。独立的 B1 V2 staging 当前仍为 NO-GO，不能称为已采用结果。
 
-| 项目 | 当前状态 |
-|---|---|
-| HarnessIR 基础流程 | 已有工程基础，可作为实验平台 |
-| H3 texture-only 漂移 | 已有用户实验观察；尚缺系统性统计和机制归因 |
-| 多候选、Code+VLM Judge、未解决状态 | 已形成设计；设计完整不等于效果已验证 |
-| 模型专属 Prompt / Evidence / 执行策略 | 已提出方向，仍需同预算消融与跨模型交叉实验 |
-| 受控纹理融合 | 候选技术路线，尚不能声称解决了真实性与保真问题 |
-| AutoRef 式外层自动优化 | 已讨论接入方案，尚无本任务上的有效性结论 |
+## 11. 分割问题如何传导到项目结果
 
-**当前最合理的阶段目标，是证明一个可重复、可定位、可干预的恢复瓶颈，而不是宣称完整 AutoHarness 已经成立。**
+### 11.1 颈部漏分
 
----
+旧版几何带无法覆盖部分脸框内的颌下暗带。颈部与外部背景连成大片时，面积门还可能拒绝整个候选。
 
-## 七、与导师重点讨论的三个决策
+可能的项目级后果为：
 
-### 1. 论文主问题应该落在哪里？
+```text
+真实颈部进入 background
+    ↓
+基础 background 统计把颈部算入背景
+基础 skin 统计与编辑又漏掉该区域
+    ↓
+背景算子与皮肤/global/refine 算子对同一局部产生不协调调整
+    ↓
+颌颈亮度差或边界带
+    ↓
+候选 Coverage 下降，Semantic 区域统计也可能失真
+```
 
-建议以**“让恢复行为匹配有效证据与任务要求”**作为上层问题，以模型适配和 Harness 优化作为实现路线。
+这不是单纯的 mask 美观问题。它直接改变候选像素。
 
-不建议把“H3 不听话”“不同模型需要不同 Prompt”直接作为论文中心：前者过窄，后者不足以建立研究差异。
+### 11.2 颈部误收背景、耳朵或头发
 
-### 2. 第一篇工作的范围是否足够收敛？
+B1 的 `person`、颜色和连通邻接不能证明候选就是颈部。真颈与背景在同一候选连通块时，整块可能被接受。
 
-建议先用 texture-only 做可控执行案例，同时选择一个具有明确正确性要求的内容子任务，例如文字或细结构，检验“有用信息被恢复”和“合理细节被生成”的区别。
+可能的项目级后果为：
 
-是否将第二类任务纳入首篇，应由前期瓶颈分析决定，避免同时铺开所有恢复任务、所有模型和所有 Agent 模块。
+- A 侧误收区域被 unified refine 提亮或改亮度。
+- B 侧误收区域污染参考 L 分位目标。
+- Semantic body 指标把错误区域计入 body，评分可能与错误使用同一支持域。
+- 背景、face-body 关系和最终 Best 都可能变化。
 
-### 3. 哪种实验结果足以支持继续推进？
+如果生成与评价使用同一错误 mask，指标改善不能独立证明误编辑不存在。
 
-建议采用三个判断条件：
+### 11.3 脸部、耳朵和发际误标
 
-**首先，** 公平比较后仍存在稳定、可避免的系统错误。
+当前 face 直接采用 SCHP `Face`，没有独立耳朵正向证据。face 又参与末尾 L refine 和 Semantic face 评价。
 
-**其次，** 一个明确机制能够降低这些错误，而非只降低处理强度或提高 Judge 分数。
+脸缘、耳朵或头发误入相邻区域时，可能同时造成：
 
-**最后，** 收益能在留出场景或另一执行器上复现，并超过充分调参的简单基线。
+- 局部亮度曲线作用于错误区域。
+- face 或 body 的参考分位统计偏移。
+- face-hair、face-body 关系指标偏移。
+- VLM ROI 展示的局部证据与实际解剖区域不一致。
 
----
+统一标签互斥只能保证一个像素不会被两个标签同时占用，不能保证这个像素分对了。
 
-## 可直接向导师介绍的一段话
+### 11.4 衣服 mask 缺失或污染
 
-> 我们最初希望通过 Harness 提升现有生成模型的真实图像恢复能力。在 H3 的实验里发现，即使诊断和 Prompt 明确要求只增强纹理，模型仍会改变颜色、亮度，甚至损伤阴影。这说明清楚地表达恢复目标，并不保证目标能够被执行。
->
-> 我们想进一步研究的不是怎么把 Prompt 写得更强，而是：恢复行为能否同时匹配输入中实际存在的证据、任务允许的修改范围和执行器的能力。方案上保留 HarnessIR 的诊断与证据基础，引入任务约束、模型适配和独立验收，再借鉴 AutoRef 搜索有效的 Harness。
->
-> 第一阶段先不做复杂自进化，而是定位失败究竟来自信息不足、证据利用、执行控制还是候选选择，用等预算实验验证一个具体机制。只有确认评价可信、机制有效，再开展自动优化，并检验它是否提供超出人工策略和简单后处理的收益。
+衣服 mask 同时决定 clothing plan、第四轴编辑和衣服评价。
+
+当前已观察两类情况：
+
+- B 侧 clothing mask 为零时，衣服不编辑，流程退回三轴。极端近景可能没有可见衣物，因此零 mask 不必然是分割失败。
+- B 侧衣服 mask 包含高色度配饰时，衣服分位曲线可能被污染。v0.5.2 的主簇门控是在编辑侧限制这一影响。
+
+零 clothing mask 需要区分真实构图与分割失败，不能只凭像素数下结论。
+
+### 11.5 A/B 两侧语义不一致
+
+A/B 独立推理满足非配准契约，但不保证两侧的区域定义一致。
+
+如果 A 的 body 包含某片颈部，而 B 的 body 没有包含对应语义区域，则 unified refine 的源和目标统计总体不同。即使数值曲线收敛，也可能是在匹配两个不同的区域集合。
+
+这也是分割质量会影响目标可解释性的原因。
+
+### 11.6 mask 与评价共享带来的盲区
+
+当前 mask 既用于构造编辑目标，又用于计算数值评分。由此产生一个项目级限制：
+
+```text
+错误 mask → 错误目标或错误编辑
+错误 mask → 错误的评分区域
+两者可能同时成立
+```
+
+因此，Semantic 分数不是完全独立于分割错误的外部裁判。需要原生图人工检查和独立区域标注来发现这类共同误差。
+
+## 12. 不属于分割重构的问题
+
+| 问题 | 所属层 | 原因 |
+|---|---|---|
+| case03 脸部色度缺口 | 编辑算子 | 当前 refine 只修改 L，不修改 face a/b |
+| soft_skin 是否采用 | 编辑权重与边界过渡 | 属于 mask 软化和编辑响应，不等于语义类别修复 |
+| 30 组 VLM error | 选择服务与响应完成度 | 不由分割标签结构直接造成 |
+| Legacy 全强度退化 | 评价公式 | 评分目标与早期 plan 构造同构 |
+| VLM Best 与人工 Oracle 不一致 | 评价体系 | 需要分析输入呈现、prompt 和模型判断 |
+| 无可见衣服的近景 | 数据构图 | 不应强行生成衣服区域 |
+| 候选池没有可接受结果 | Candidate Coverage | 可能需要改目标、算子或候选范围，不能先归因选择器 |
+
+项目决策树应先区分 Coverage、Selection 和 mask 输入质量。统一分割不能替代这些归因步骤。
+
+## 13. 当前项目状态
+
+### 13.1 当前采用与验证
+
+当前采用实验基线为 v0.5.2。现有 nb212 产物共有 212 组，原始 `summary.json` 实算为：
+
+- 182 组 `vlm_status=ok`。
+- 30 组 `vlm_status=error`。
+- gain 均值约 39.0%，中位约 38.0%。
+
+这些数字描述历史批量结果。它们不是分割正确率、人工视觉通过率或生产部署证明。
+
+本轮按交接命令实跑旧路径测试，结果为 `505 passed`。项目 self-test 与评价相关小型测试也已执行通过。测试证明当前代码契约自洽，不证明所有 case 的视觉结果正确。
+
+### 13.2 当前主要阻塞与归属
+
+| 事项 | 当前状态 | 与分割的关系 |
+|---|---|---|
+| r4/r8/r16 颈部内缩人工评审 | 每个半径仍有 23 pending 和 1 N/A | 直接相关，尚未选全局半径 |
+| B1 V2 staging | NO-GO | 直接相关，不能部署或视为通过 |
+| nb212 30 组 VLM error | 未补评 | 选择链问题，独立处理 |
+| soft_skin 采用 | 未最终裁决，配置默认关闭 | 编辑权重问题，独立处理 |
+| B 侧衣服零 mask | 部分抽样更像近景构图 | 需逐类区分，不能统称分割故障 |
+| case03 脸部色度缺口 | 未立项 | 编辑算子问题 |
+| V3 phase1 | 独立实验树 | 不属于当前采用基线 |
+
+## 14. 已提出的统一分割设想在全局中的位置
+
+本节只评价已有设想，不展开新的设计。
+
+### 14.1 已有设想针对的层次
+
+已有草稿提出用单标签 `region_map` 管理 background、face、hair、clothing、body、neck、unknown，再从原子标签派生业务 mask。
+
+它主要针对项目输入层的以下问题：
+
+- 多个入口分别生成和修改 mask，语义定义容易漂移。
+- body 与 neck 混在一起，缺少独立诊断视图。
+- Background 同时容纳真实背景、漏分皮肤和未建模类别。
+- 多模型重叠时缺少统一冲突处理。
+- 不确定像素没有显式出口。
+- mask 的结构校验、溯源和语义验收没有统一管理。
+
+这些确实是项目的基础输入问题，因为后续生成和评价都消费这些 mask。
+
+### 14.2 它可能带来的项目级收益
+
+如果实现并通过验收，统一分割可以：
+
+- 让编辑支持域和评分区域的定义更可审计。
+- 独立检查 neck，而不是从 body 增量间接推断。
+- 避免把不确定区域自动送入 background 编辑。
+- 为耳朵和颈部增加更可靠的模型证据提供统一入口。
+- 减少 A/B、不同准备脚本和不同实验批次之间的语义漂移。
+- 让分割错误的归因与下游编辑、评价问题分开。
+
+这些收益首先改变输入质量和可解释性。最终图像是否改善仍需端到端实验。
+
+### 14.3 它不能自动解决的问题
+
+统一分割不能自动解决：
+
+- SCHP 或 OneFormer 本身的误分。
+- 没有可靠耳朵或颈部标签的问题。
+- `person` 外轮廓过分割。
+- 真颈与背景在同一连通块中的分离。
+- 当前编辑算子只有 L refine、缺少脸部色度控制的问题。
+- Legacy 或 Semantic 评分与人工感知不一致的问题。
+- VLM error 或 VLM 选择偏差。
+- soft_skin 的过渡效果。
+- 数据本身没有可见颈部或衣服的问题。
+- 普通历史输出缺少完整输入哈希快照的问题。
+
+把多张 mask 换成一张 label map，只保证结构一致，不保证语义正确。
+
+### 14.4 对项目主流程的潜在影响
+
+分割变更可能改变：
+
+- `build_plan` 的 B 侧目标统计。
+- `apply_plan` 的 A 侧编辑范围。
+- Semantic 的评价区域和可用区域集合。
+- Code Best、Code Top4 与 Hybrid 输入。
+- 历史 gain 的可比性。
+- 冻结实验的输入哈希。
+
+因此，分割重构不是可以悄悄替换的前处理。它必须作为新的实验变量，与既有 v0.5.2 结果分开验证。
+
+### 14.5 当前合理定位
+
+统一分割设想应被定位为“项目输入层的基础改造候选”，而不是整个项目的新流程，也不是当前所有问题的统一答案。
+
+在继续该设想前，需要先回答三个项目级问题：
+
+1. 哪些已确认的视觉失败能明确归因到 mask，而不是算子或评价。
+2. 新 mask 如何保持旧业务语义，避免同时改变编辑和评价口径而无法归因。
+3. 使用什么人工真值和端到端对照证明项目结果确实改善。
+
+当前这些验收工作尚未完成，所以默认流程仍是现有 v0.5.2 与现有 mask 生成路径。
+
+## 15. 整体理解总结
+
+整个项目可以分成五层：
+
+| 层 | 核心问题 | 当前实现 |
+|---|---|---|
+| 输入与分割 | 哪些像素属于同一语义区域 | SCHP、旧 neck 找回、可选 OneFormer B1 |
+| 诊断与计划 | A 与 B 的区域差异是多少 | 区域统计、分位目标、主簇门控 |
+| 确定性生成 | 如何产生不同力度的候选 | 固定 12 候选与 Lab 算子 |
+| 评价与选择 | 哪个候选更接近参考且自然 | Semantic、Legacy、VLM、Hybrid、listwise |
+| 人工与实验裁决 | 数值结果是否真的可接受 | 原生图、Oracle、Acceptable IDs、冻结实验 |
+
+语义分割位于第一层，但它的输出会进入第二、第三和第四层。分割重构会影响全项目，却不能代替后面四层。
+
+项目问题应按以下顺序归因：
+
+```text
+先确认 mask 与区域语义是否可信
+    ↓
+再确认候选池是否存在可接受结果
+    ↓
+再确认 Code/VLM/Hybrid 是否选中它
+    ↓
+最后判断数值指标和实验汇总是否支持采用
+```
+
+这个顺序可以避免三类常见误判：
+
+- 把分割或算子造成的候选失败误判为选择器失败。
+- 把同一错误 mask 下的指标改善误判为视觉改善。
+- 把统一分割的结构改造误判为整个项目已经升级。
+
+## 16. 主要代码与文档入口
+
+### 主流程
+
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/run.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/editor.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/evaluate.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/semantic_eval.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/listwise_v02.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/config_v052_gate.json`
+
+### 分割与数据准备
+
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/tools/make_semantic_masks.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/tools/prepare_newbinary_cases.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/tools/neck_b1.py`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/tools/neck_b1_derive_batch.py`
+
+### 项目与实验文档
+
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/docs/01_RESEARCH_OBJECTIVE.md`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/docs/04_SEMANTIC_EVAL_V02.md`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/docs/05_FROZEN_LISTWISE_V0_V1_V2.md`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/docs/10_VERSION_LINE_V01_V052.md`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/docs/nb212_v052_test_plan_20261113.md`
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/docs/HANDOVER_2026-11-21.md`
+
+### 已提出但未实施的分割草稿
+
+- `code/RetouchAgent/RefTouch-main/RefTouch-main-v2/docs/superpowers/specs/2026-11-21-unified-segmentation-design.md`
+
+该草稿不是当前实现，也不是本文重新提出的方案。
+
+## 17. 本轮验证
+
+旧路径完整回归命令：
+
+```bash
+cd code/RetouchAgent/RefTouch-main/RefTouch-main-v2
+PYTHONDONTWRITEBYTECODE=1 venvs/hre-v3/bin/python \
+  -m pytest -p no:cacheprovider tests work/neck_boundary_erode_20261119 -q
+```
+
+实测结果为 `505 passed in 35.92s`。
+
+项目 self-test 已实际执行并通过。评价相关小型测试和临时目录 pipeline smoke 也已执行，未调用真实外部 VLM。
+
+nb212 统计直接从 212 份 `summary.json` 重算，得到 182 组 ok、30 组 error。候选与当前 mask 的时点差异通过 212 张 `C00.png`、212 个当前数据 case 的文件 mtime 和报告字段实测确认。
+
+本文只做现状梳理。没有修改项目代码，没有重生成候选或 mask，也没有提出新的分割实施方案。
