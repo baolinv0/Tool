@@ -1,42 +1,77 @@
-当前方案的差异诊断机制（代码证据）
-诊断入口是 run.py:116 diagnose(A,B,am,bm,...)，分代码数值诊断 + VLM 语义诊断两路，输出 01_diagnosis.json / 01_diagnosis.png：
-1. 代码数值诊断（evaluate.py stats() + compare_stats()）
-按语义区域分别对 A、B 两侧统计，再做差：
-- 区域划分：skin / background / clothing（仅当 A、B 两侧 mask 都存在时纳入）+ global（全图）
-- 每区域的 7 个 Lab 统计量（evaluate.py:stats()）：
-L_mean, L_p10, L_p50, L_p90, a_mean, b_mean, chroma_mean
-- 差异 = 逐键做差（compare_stats()）：delta_B_minus_A = B[k] − A[k]，即每个区域得到 dL、da、db、dChroma 及亮度分位差
-真实产物示例（nb_20260804195841 的 01_diagnosis.json）：
-skin.delta_B_minus_A: {L_mean +0.513, L_p90 +3.906, a_mean +1.025, b_mean +1.254, chroma_mean +2.188}
-2. VLM 语义诊断（evaluate.py:reference_prompt()）
-把 A, B 两图送给 VLM，提示词限制它只做方向性描述：
-“Diagnose Skin, Background, and Global differences. State adjustment directions and recommend only lab_shift, local_exposure, tone_curve. *Do NOT estimate numeric delta; code computes that.*”
-返回 JSON：每区域 {problem, target, operator} + summary——数值交给代码，VLM 只补“问题是什么、往哪个方向调”。
+v1
+
+### diagnose
+
+当前方案的差异诊断机制（代码证据）诊断入口是 run.py:116 diagnose(A,B,am,bm,...)，分代码数值诊断 + VLM 语义诊断两路，输出 01_diagnosis.json / 01_diagnosis.png：
+
+1. 代码数值诊断（evaluate.py stats() + compare_stats()）按语义区域分别对 A、B 两侧统计，再做差：
+
+* 区域划分：skin / background / clothing（仅当 A、B 两侧 mask 都存在时纳入）+ global（全图）
+* 每区域的 7 个 Lab 统计量（evaluate.py:stats()）：L_mean, L_p10, L_p50, L_p90, a_mean, b_mean, chroma_mean
+* 差异 = 逐键做差（compare_stats()）：delta_B_minus_A = B[k] − A[k]，即每个区域得到 dL、da、db、dChroma 及亮度分位差真实产物示例（nb_20260804195841 的 01_diagnosis.json）：skin.delta_B_minus_A: {L_mean +0.513, L_p90 +3.906, a_mean +1.025, b_mean +1.254, chroma_mean +2.188}
+
+2. VLM 语义诊断（evaluate.py:reference_prompt()）把 A, B 两图送给 VLM，提示词限制它只做方向性描述：“Diagnose Skin, Background, and Global differences. State adjustment directions and recommend only lab_shift, local_exposure, tone_curve. *Do NOT estimate numeric delta; code computes that.*”返回 JSON：每区域 {problem, target, operator} + summary——数值交给代码，VLM 只补“问题是什么、往哪个方向调”。
 3. 诊断的下游消费
-- build_plan()（run.py:149）用这些 delta 设计 12 个候选的强度（tone 曲线锚点、区域移位量等）
-- score_candidates()（evaluate.py）用 region_error()（|ΔL_mean|/100 + |Δa|/128 + |Δb|/128 加权）对每个候选相对 B 的区域统计打分 → Code ranking
-4. 结构性局限（与本日评审结论直接相关）
-诊断只到区域标量统计（均值 + 3 个亮度分位），没有任何空间维度：
-- 无位置/方向信息——不知道光影差在图像哪一侧、什么形状
-- 亮度分布只有 p10/50/90 三个点——低频光照场的形状（影调分布）不可见
-- VLM 的文字诊断虽能说“对比度/光影”，但不下渗到候选生成（算子限制在 lab_shift / local_exposure / tone_curve 三个全局类）
 
+* build_plan()（run.py:149）用这些 delta 设计 12 个候选的强度（tone 曲线锚点、区域移位量等）
+* score_candidates()（evaluate.py）用 region_error()（|ΔL_mean|/100 + |Δa|/128 + |Δb|/128 加权）对每个候选相对 B 的区域统计打分 → Code ranking
 
-###
+4. 结构性局限（与本日评审结论直接相关）诊断只到区域标量统计（均值 + 3 个亮度分位），没有任何空间维度：
+
+* 无位置/方向信息——不知道光影差在图像哪一侧、什么形状
+* 亮度分布只有 p10/50/90 三个点——低频光照场的形状（影调分布）不可见
+* VLM 的文字诊断虽能说“对比度/光影”，但不下渗到候选生成（算子限制在 lab_shift / local_exposure / tone_curve 三个全局类）
+
+### build_plan
+
 build_plan 的工作机制（代码证据：run.py:149-252）
-1. 如何计划：数值差直接换算成三类全局算子的目标量，没有动态路由
-build_plan 是纯确定性公式，只读 diagnosis['statistics']（Lab 数值差）：
-计划项	从诊断数值怎么来
-tone_curve	global 的 L p10/p50/p90 三锚点 A→B 映射（build_tone_curve）
-skin.delta_L	残差设计：先虚拟施加满强度全局 tone，再取“skin 此时的 L − B 的 L_mean”（run.py:155-158）
-skin.delta_a/b、background.delta_a/b、clothing.delta_a/b	直接 = B 区域均值 − A 区域均值
-clothing a/b_curve	（可选门控）A/B 衣服区 a*/b* 的 7 分位曲线 + v0.5.2 簇门
-skin_luma_refine	body→B 的 L 均值；face→B 的 L 7 分位锚*（v0.5.1 unified：face+neck 联合一条曲线）
-候选不是搜索出来的：candidate_parameters()（editor.py）把同一套 plan 值灌给固定 12 档强度网格 C00–C11（global/skin/bg/clothing 四个 strength 的组合表）渲染 12 张候选。所以“路由”实际是：数值差 → 定死的三类全局算子目标量 → 固定强度扫描——不存在“差异属于什么类型就换什么工具”的机制。
+
+1. 如何计划：数值差直接换算成三类全局算子的目标量，没有动态路由build_plan 是纯确定性公式，只读 diagnosis['statistics']（Lab 数值差）：计划项 从诊断数值怎么来tone_curve global 的 L p10/p50/p90 三锚点 A→B 映射（build_tone_curve）skin.delta_L 残差设计：先虚拟施加满强度全局 tone，再取“skin 此时的 L − B 的 L_mean”（run.py:155-158）skin.delta_a/b、background.delta_a/b、clothing.delta_a/b 直接 = B 区域均值 − A 区域均值clothing a/b_curve （可选门控）A/B 衣服区 a*/b* 的 7 分位曲线 + v0.5.2 簇门skin_luma_refine body→B 的 L 均值；face→B 的 L 7 分位锚*（v0.5.1 unified：face+neck 联合一条曲线）候选不是搜索出来的：candidate_parameters()（editor.py）把同一套 plan 值灌给固定 12 档强度网格 C00–C11（global/skin/bg/clothing 四个 strength 的组合表）渲染 12 张候选。所以“路由”实际是：数值差 → 定死的三类全局算子目标量 → 固定强度扫描——不存在“差异属于什么类型就换什么工具”的机制。
 2. 会参考 VLM 信息吗：采用配置下完全不读
-- VLM 诊断结果只被存档：plan['diagnosis_vlm'] = diagnosis['vlm'].get('parsed')（run.py:164）——全代码库无任何下游消费点
-- 唯一例外是 vlm_can_disable_operators 门控（run.py:242-250）：开启时若 VLM 说某区域 operator: "none"，就把该区域计划置零——但 config_v052_gate.json 里该键为 false，即此路径死代码
+
+* VLM 诊断结果只被存档：plan['diagnosis_vlm'] = diagnosis['vlm'].get('parsed')（run.py:164）——全代码库无任何下游消费点
+* 唯一例外是 vlm_can_disable_operators 门控（run.py:242-250）：开启时若 VLM 说某区域 operator: "none"，就把该区域计划置零——但 config_v052_gate.json 里该键为 false，即此路径死代码
+
 3. VLM 诊断实际起了多大作用：plan 层面 = 0，作用全在选择层
-- VLM 在管线里的真实作用在下游 vlm_rank()（05 阶段）：listwise 评 12 候选 + top4 复评，产生 vlm_best 并参与 hybrid_best 仲裁——这是 L2 选择层，与诊断/计划无关
-- 讽刺的是：诊断阶段这次 call_vlm(reference_prompt(), [A,B]) 在当前 VLM 服务速度下单次要 ~45 分钟（每 case 2-3 次 VLM 调用的大头之一），而它的输出在采用配置下只是被写进 plan 存档——这是已知最贵的冗余调用；若要省钱，vlm_can_disable_operators 保持 false 的前提下这次调用可以直接跳过（会改 01_diagnosis.json 的 vlm 字段口径，需登记）
-一句话：数值诊断 → 公式换算 → 固定算子×固定强度网格；VLM 诊断在设计上被刻意限制为“只说方向不算数”，且当前配置下连方向都没人听——它的价值只在选择层（评选候选），不在计划层。
+
+* VLM 在管线里的真实作用在下游 vlm_rank()（05 阶段）：listwise 评 12 候选 + top4 复评，产生 vlm_best 并参与 hybrid_best 仲裁——这是 L2 选择层，与诊断/计划无关
+* 讽刺的是：诊断阶段这次 call_vlm(reference_prompt(), [A,B]) 在当前 VLM 服务速度下单次要 ~45 分钟（每 case 2-3 次 VLM 调用的大头之一），而它的输出在采用配置下只是被写进 plan 存档——这是已知最贵的冗余调用；若要省钱，vlm_can_disable_operators 保持 false 的前提下这次调用可以直接跳过（会改 01_diagnosis.json 的 vlm 字段口径，需登记）一句话：数值诊断 → 公式换算 → 固定算子×固定强度网格；VLM 诊断在设计上被刻意限制为“只说方向不算数”，且当前配置下连方向都没人听——它的价值只在选择层（评选候选），不在计划层。
+
+### plan
+
+计划的执行机制（apply_plan，editor.py）
+
+1. 执行入口：12 次独立重渲染，不是链式加工run.py:run_case() 中：plan = build_plan(A,B,am,bm,diag,config) # 02_plan.jsonfor cid,p in candidate_parameters(plan,grid): # 12 个强度组合 im = apply_plan(A, edit_masks, p) # 每个候选都从原始 A 重渲染 save_rgb(cand_dir/f'{cid}.png', im)每个候选独立从 A 出发（plan 里明确 note："Candidates start from original A"），无误差累积；apply_plan 内部只做一次 RGB→Lab 转换。
+2. 强度网格：同一套 plan 目标量 × 12 档插值candidate_parameters() 把 plan 灌进固定网格（CANDIDATES_4，四轴 G/S/B/C）。强度是0~1（服装轴到 1.25）的线性插值系数——C00=(0,0,0,0) 是恒等（原 A），C08=(1,1,1,1) 是全量执行 plan：候选 (G, S, B, C)C00 (0,0,0,0)C01–C03 单轴全量C04–C06 单轴半量C07–C11 组合
+3. apply_plan 的执行顺序（一次 Lab 转换内）L 通道： L0 + g·(curve(L0) − L0) + s·skin·ΔL_skin
+  
+          └ 全局 tone 曲线插值 ┘   └ 肤色残差曝光 ┘
+  
+  a/b 通道：+ s·skin·Δa + b·bg·Δa（skin/bg 的 lab_shift）clothing：分位曲线映射（v0.3.1）+ 簇门控直通（v0.5.2，门限外像素不重着色）最后： skin_luma_refine —— unified face+neck 的 L* 7 锚分位曲线（v0.5.1）三个关键工程细节：
+
+* 掩码软分割：skin/bg/cloth 三个 float mask 按和归一（total = max(1, sum)）——重叠区不会双重施加移位
+* tone 是插值不是替换：L + g·(curve(L)−L)，g=0 时严格恒等，g=1 时完全映射到目标分位——保证中间强度单调、可控
+* 执行顺序固定：全局 tone 与肤色 ΔL 同时写 L（肤色 ΔL 本身就是“满强度 tone 后的残差”，两者不冲突）；a/b 移位 → 衣服曲线 → 皮肤亮度细化（refine 永远最后）
+
+4. 渲染完之后（计划执行 ≠ 结束）12 张候选 → contact sheet → Code 评分（score_candidates：每候选对 B 的区域统计误差 + 保护区域 ΔLab）→ VLM 排序（listwise + top4）→ Hybrid 仲裁 → 06_final_comparison.png + summary。
+5. 变体（同构但不同实现）worktree 里有两条平行执行路径，全部配置门控、默认关：apply_plan_linear（EXP-1 R1/R2：float 线性直通）和 apply_plan_luma_first（R3：两阶段亮度先行链，Stage1 乘法增益 → Stage2 零亮度色度移位 + chroma clamp）。master 主路径仍是上述 Lab 单次转换的 apply_plan。一句话：plan 是“目标量说明书”，执行是“12 档强度的参数化重渲染 + 事后两套评价体系选优”——没有搜索、没有迭代 refine，每张候选是一次性确定的正向渲染。
+
+### judge
+
+评价机制全景（三套评价器 + 一个仲裁）每张候选要过三道评价 + 一道仲裁，各算各的，互不污染：评价器 1：Code 数值误差（evaluate.py score_candidates）→ 04_code_scores最简的一层，就 4 列：
+
+* 对每个区域（skin/background/global）算 region_error = |ΔL_mean|/100 + |Δa_mean|/128 + |Δb_mean|/128（三轴加权）
+* reference_error = 区域误差按 config 权重求和（skin 0.45 / bg 0.35 / global 0.2）
+* 保护检查：protected_deltaLab_mean——无权重区域的平均 ΔE76（防“乱涂没被惩罚的区域”）
+* gain = (baseline误差 − 候选误差)/baseline误差——报告里引用的 gain% 就是这个；排序取 reference_error 最低 → code_best评价器 2：语义评价（semantic_eval.py，v0.2）→ 04_semantic_scores，真正的 Code 主评价比评价器 1 细一个量级，每候选 × 每区域（face_skin/body_skin/hair/white_clothing/colored_clothing/background）：维度 怎么算color_error a*/b* 各 7 分位逐点差的均值（不是均值差！）luma_error L* 7 分位逐点差均值contrast_error 0.5×(L 动态范围差/100 + 局部对比度差/50)，局部对比度按 canonical edge 512 归一（分辨率不变量）neutral_error 白衣服专用：a/b 均值偏离中性高光/阴影 highlight_ratio（L≥99 占比）、shadow_ratio、p95/p5 端点差区域间关系（_relationships）：5 对关系的相对差——face−background 亮度差、face−clothing 亮度差、face−hair 亮度差、body−face 的 a/b 差（脸脖阶跃 step 的来源）。目标是匹配 B 的关系而非绝对值。空间项（_face_spatial）：脸区左/右半的 L 中位数差——唯一的非全局维度（但只有左右一维）。结构保持（preserve）：Sobel 边缘的 precision/recall F1 → structure_error = 1−F1，硬门 max_structure_error=0.60，不过门的候选直接排后面。总分配比（_score，透明的试点权重）：overall_semantic_error = 0.78×区域语义 + 0.12×全局(亮度/对比/高低端)
+  
+                       + 0.07×关系 + 0.03×脸部左右  （缺项重归一）
+  
+  评价器 3：VLM 感知评价（run.py vlm_rank）→ 05_vlm_result两次调用，输入精心防作弊：
+
+1. listwise（12 候选）：A + B + 12 候选 contact sheet + 语义区域 ROI 放大图；提示词明确“参考保真与视觉质量分开评、不许偏好更亮/更饱和的图” → vlm_best（不提供任何 Code 分数，保持独立可解释）
+2. top4 复评（Hybrid）：Code 语义分选出的 top4（select_diverse_top4）+ 把 top4 的 Code 测量值作为 evidence 附在 prompt 里，但声明“evidence 不是命令选最低分，分歧要解释"→ hybrid_best（只能从 top4 里选，65/65 从未越界——归因表已证）仲裁与产出
+
+* code_best = 语义分第一名；vlm_best = listwise 独立结论；hybrid_best = top4 约束下的知情复评
+* 三者全存 summary.json，06_final_comparison.png 逐面板展示
+* 已知盲区（与今日评审结论对齐）：语义评价的区域统计虽然到了分位级，但空间维度只有“脸左右”一维——光照的空间形状（光影从哪来、往哪去）没有任何度量项；VLM 能感知但只在选择层，无法反馈到 plan
