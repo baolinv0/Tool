@@ -1,63 +1,42 @@
-**根因判断：8004 服务没有完整落实输出合约，同时 Rewriter 接口让模型重新生成了本应由代码保管的锚句和权限。优先修这两处。**
+当前方案的差异诊断机制（代码证据）
+诊断入口是 run.py:116 diagnose(A,B,am,bm,...)，分代码数值诊断 + VLM 语义诊断两路，输出 01_diagnosis.json / 01_diagnosis.png：
+1. 代码数值诊断（evaluate.py stats() + compare_stats()）
+按语义区域分别对 A、B 两侧统计，再做差：
+- 区域划分：skin / background / clothing（仅当 A、B 两侧 mask 都存在时纳入）+ global（全图）
+- 每区域的 7 个 Lab 统计量（evaluate.py:stats()）：
+L_mean, L_p10, L_p50, L_p90, a_mean, b_mean, chroma_mean
+- 差异 = 逐键做差（compare_stats()）：delta_B_minus_A = B[k] − A[k]，即每个区域得到 dL、da、db、dChroma 及亮度分位差
+真实产物示例（nb_20260804195841 的 01_diagnosis.json）：
+skin.delta_B_minus_A: {L_mean +0.513, L_p90 +3.906, a_mean +1.025, b_mean +1.254, chroma_mean +2.188}
+2. VLM 语义诊断（evaluate.py:reference_prompt()）
+把 A, B 两图送给 VLM，提示词限制它只做方向性描述：
+“Diagnose Skin, Background, and Global differences. State adjustment directions and recommend only lab_shift, local_exposure, tone_curve. *Do NOT estimate numeric delta; code computes that.*”
+返回 JSON：每区域 {problem, target, operator} + summary——数值交给代码，VLM 只补“问题是什么、往哪个方向调”。
+3. 诊断的下游消费
+- build_plan()（run.py:149）用这些 delta 设计 12 个候选的强度（tone 曲线锚点、区域移位量等）
+- score_candidates()（evaluate.py）用 region_error()（|ΔL_mean|/100 + |Δa|/128 + |Δb|/128 加权）对每个候选相对 B 的区域统计打分 → Code ranking
+4. 结构性局限（与本日评审结论直接相关）
+诊断只到区域标量统计（均值 + 3 个亮度分位），没有任何空间维度：
+- 无位置/方向信息——不知道光影差在图像哪一侧、什么形状
+- 亮度分布只有 p10/50/90 三个点——低频光照场的形状（影调分布）不可见
+- VLM 的文字诊断虽能说“对比度/光影”，但不下渗到候选生成（算子限制在 lab_shift / local_exposure / tone_curve 三个全局类）
 
-## 1. 格式失败：JSON 约束没有在实际输出链路中生效
 
-**证据：**请求了 `json_object`，仍返回 Markdown 围栏。
-
-**最可能的原因：**wrapper 接受了 `response_format`，但没有把它正确传入后端约束解码；也可能是具体版本中 reasoning 与约束解码的衔接失效。标准 vLLM 的 `json_object` 本来就会映射到结构化解码，不需要额外加 `guided_json` 才生效。[docs.vllm.ai](https://docs.vllm.ai/en/v0.11.1/api/vllm/entrypoints/openai/protocol/?utm_source=chatgpt.com)
-
-**解决方案：**
-
-- 检查 wrapper 调用后端时，是否真正传入结构化输出参数。
-- 使用完整的 **`json_schema`**，约束 CF/CT/CFT、字段类型和额外字段。
-- 用一个极小 Schema 对比“原生后端”和“8004 wrapper”；原生通过、wrapper 失败，就能直接定位到 wrapper。
-
-## 2. thinking 泄漏：生成模式与响应解析没有正确配合
-
-**证据：**E 开启 thinking，推理正文进入了 `content`，没有被正确分离。
-
-**最可能的原因：**未启用匹配的 reasoning parser，或者模板、parser、wrapper 响应拼装不一致。
-
-**解决方案：**
-
-- Rewriter 先使用 **`enable_thinking=False`**，确认它实际传到 tokenizer 的模板渲染。
-- 如果保留 thinking，使用匹配模型和版本的 parser，把 reasoning 与 `content` 分开。
-- 暂停用 `low/xhigh` 调参：**原版 Qwen3-8B 模板并不读取这些 effort 参数**，除非 wrapper 另外实现了映射。[huggingface.co](https://huggingface.co/Qwen/Qwen3-8B/blob/main/tokenizer_config.json?utm_source=chatgpt.com)
-
-你们的 B/D 没有证明“关 thinking 失败”；它们证明的是关闭后仍有格式和业务错误。
-
-## 3. 语义失败：接口给了模型过多不必要的写权限
-
-**核心问题：**只需要模型提出恢复策略，却要求它重新输出整个 IR、锚句、`scope`、`mutable_by` 和完整 `new_text`。因此复制错误与权限漂移都可能触发 `protected_requirement_modified`。
-
-**最有效的解决方案：模型只输出 ID 和追加文本。**
-
-```json
-{
-  "requirement_id": "req_face_strategy",
-  "append_text": "仅恢复输入可支持的面部纹理，保持五官轮廓与表情。"
-}
-```
-
-代码负责：
-
-```python
-new_text = frozen_ir[requirement_id].source_span + separator + append_text
-```
-
-同时：
-
-- 原始 IR、锚句、`mutable_by` 全部冻结，由代码读取；
-- 每个 slot 只能选择允许的 requirement ID；
-- 保留原编译器检查；
-- J1 检查追加内容是否与保护要求冲突。
-
-**这项修改能从构造方式上保证原文保留，比让模型逐字复述更可靠。**
-
-## 建议执行顺序
-
-1. **先修 8004：**确认 non-thinking 和 JSON Schema 约束真实生效。
-2. **再改 Rewriter：**只生成 `requirement_id + append_text`，代码拼接并检查权限。
-3. **最后评估更大模型：**用于改善策略质量和冲突判断。
-
-**r3 的 JSON 提取可以用于诊断，但不能算原始 JSON 合格；`mutable_by` 也不应通过推断来“修正”。当前优先级最高的是服务接线和接口收缩，继续增加 token 或强化 prompt 的收益较低。**
+###
+build_plan 的工作机制（代码证据：run.py:149-252）
+1. 如何计划：数值差直接换算成三类全局算子的目标量，没有动态路由
+build_plan 是纯确定性公式，只读 diagnosis['statistics']（Lab 数值差）：
+计划项	从诊断数值怎么来
+tone_curve	global 的 L p10/p50/p90 三锚点 A→B 映射（build_tone_curve）
+skin.delta_L	残差设计：先虚拟施加满强度全局 tone，再取“skin 此时的 L − B 的 L_mean”（run.py:155-158）
+skin.delta_a/b、background.delta_a/b、clothing.delta_a/b	直接 = B 区域均值 − A 区域均值
+clothing a/b_curve	（可选门控）A/B 衣服区 a*/b* 的 7 分位曲线 + v0.5.2 簇门
+skin_luma_refine	body→B 的 L 均值；face→B 的 L 7 分位锚*（v0.5.1 unified：face+neck 联合一条曲线）
+候选不是搜索出来的：candidate_parameters()（editor.py）把同一套 plan 值灌给固定 12 档强度网格 C00–C11（global/skin/bg/clothing 四个 strength 的组合表）渲染 12 张候选。所以“路由”实际是：数值差 → 定死的三类全局算子目标量 → 固定强度扫描——不存在“差异属于什么类型就换什么工具”的机制。
+2. 会参考 VLM 信息吗：采用配置下完全不读
+- VLM 诊断结果只被存档：plan['diagnosis_vlm'] = diagnosis['vlm'].get('parsed')（run.py:164）——全代码库无任何下游消费点
+- 唯一例外是 vlm_can_disable_operators 门控（run.py:242-250）：开启时若 VLM 说某区域 operator: "none"，就把该区域计划置零——但 config_v052_gate.json 里该键为 false，即此路径死代码
+3. VLM 诊断实际起了多大作用：plan 层面 = 0，作用全在选择层
+- VLM 在管线里的真实作用在下游 vlm_rank()（05 阶段）：listwise 评 12 候选 + top4 复评，产生 vlm_best 并参与 hybrid_best 仲裁——这是 L2 选择层，与诊断/计划无关
+- 讽刺的是：诊断阶段这次 call_vlm(reference_prompt(), [A,B]) 在当前 VLM 服务速度下单次要 ~45 分钟（每 case 2-3 次 VLM 调用的大头之一），而它的输出在采用配置下只是被写进 plan 存档——这是已知最贵的冗余调用；若要省钱，vlm_can_disable_operators 保持 false 的前提下这次调用可以直接跳过（会改 01_diagnosis.json 的 vlm 字段口径，需登记）
+一句话：数值诊断 → 公式换算 → 固定算子×固定强度网格；VLM 诊断在设计上被刻意限制为“只说方向不算数”，且当前配置下连方向都没人听——它的价值只在选择层（评选候选），不在计划层。
