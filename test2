@@ -1,77 +1,212 @@
-v1
+# TMOXR 下一阶段研究方案（导师讨论稿）
 
-### diagnose
+**日期**：2026-11-27  
+**状态**：已有实验全部收官；下一阶段尚未启动训练  
+**核心议题**：如何把“网络能够学会区域分离”转化为“真实验证集 PSNR 收益”，同时不把非目标样本拖坏？
 
-当前方案的差异诊断机制（代码证据）诊断入口是 run.py:116 diagnose(A,B,am,bm,...)，分代码数值诊断 + VLM 语义诊断两路，输出 01_diagnosis.json / 01_diagnosis.png：
+---
 
-1. 代码数值诊断（evaluate.py stats() + compare_stats()）按语义区域分别对 A、B 两侧统计，再做差：
+## 1. 总目标与研究边界
 
-* 区域划分：skin / background / clothing（仅当 A、B 两侧 mask 都存在时纳入）+ global（全图）
-* 每区域的 7 个 Lab 统计量（evaluate.py:stats()）：L_mean, L_p10, L_p50, L_p90, a_mean, b_mean, chroma_mean
-* 差异 = 逐键做差（compare_stats()）：delta_B_minus_A = B[k] − A[k]，即每个区域得到 dL、da、db、dChroma 及亮度分位差真实产物示例（nb_20260804195841 的 01_diagnosis.json）：skin.delta_B_minus_A: {L_mean +0.513, L_p90 +3.906, a_mean +1.025, b_mean +1.254, chroma_mean +2.188}
+### 1.1 工程目标
 
-2. VLM 语义诊断（evaluate.py:reference_prompt()）把 A, B 两图送给 VLM，提示词限制它只做方向性描述：“Diagnose Skin, Background, and Global differences. State adjustment directions and recommend only lab_shift, local_exposure, tone_curve. *Do NOT estimate numeric delta; code computes that.*”返回 JSON：每区域 {problem, target, operator} + summary——数值交给代码，VLM 只补“问题是什么、往哪个方向调”。
-3. 诊断的下游消费
+在真实 AppleGT photofinishing 任务上，得到一个**在真实验证集上不劣于 baseline C、最好严格优于 C** 的模型，并保持原始网络、损失接口和部署 `state_dict` 兼容。
 
-* build_plan()（run.py:149）用这些 delta 设计 12 个候选的强度（tone 曲线锚点、区域移位量等）
-* score_candidates()（evaluate.py）用 region_error()（|ΔL_mean|/100 + |Δa|/128 + |Δb|/128 加权）对每个候选相对 B 的区域统计打分 → Code ranking
+当前可用交付物仍是 **baseline C**。visual_eval_v1 中，C 的 3-seed 官方 PSNR 为 **28.405 dB**，SS2 为 28.191，SS3 为 27.826；两个候选都没有通过 −0.05 dB 的 PSNR 保护门。视觉评审没有授权另一个 winner：Qwen swap 审计一致率 0.31、直接反转率 0.18，双门均失败，因此不能把 VLM 视觉判断当作模型优选依据。
 
-4. 结构性局限（与本日评审结论直接相关）诊断只到区域标量统计（均值 + 3 个亮度分位），没有任何空间维度：
+### 1.2 科学目标
 
-* 无位置/方向信息——不知道光影差在图像哪一侧、什么形状
-* 亮度分布只有 p10/50/90 三个点——低频光照场的形状（影调分布）不可见
-* VLM 的文字诊断虽能说“对比度/光影”，但不下渗到候选生成（算子限制在 lab_shift / local_exposure / tone_curve 三个全局类）
+解释并修复以下核心矛盾：
 
-### build_plan
+> **诊断显示网络只交付了 GT 所要求区域分离的一部分；辅助分离监督确实能提高分离量，但提高分离量并没有稳定转化为 PSNR 收益，反而给非目标样本带来损失。**
 
-build_plan 的工作机制（代码证据：run.py:149-252）
+因此，下一阶段不是继续证明“分离量能被提高”，而是检验**哪种目标定义和投放方式能在保留收益的同时消除附带税**。
 
-1. 如何计划：数值差直接换算成三类全局算子的目标量，没有动态路由build_plan 是纯确定性公式，只读 diagnosis['statistics']（Lab 数值差）：计划项 从诊断数值怎么来tone_curve global 的 L p10/p50/p90 三锚点 A→B 映射（build_tone_curve）skin.delta_L 残差设计：先虚拟施加满强度全局 tone，再取“skin 此时的 L − B 的 L_mean”（run.py:155-158）skin.delta_a/b、background.delta_a/b、clothing.delta_a/b 直接 = B 区域均值 − A 区域均值clothing a/b_curve （可选门控）A/B 衣服区 a*/b* 的 7 分位曲线 + v0.5.2 簇门skin_luma_refine body→B 的 L 均值；face→B 的 L 7 分位锚*（v0.5.1 unified：face+neck 联合一条曲线）候选不是搜索出来的：candidate_parameters()（editor.py）把同一套 plan 值灌给固定 12 档强度网格 C00–C11（global/skin/bg/clothing 四个 strength 的组合表）渲染 12 张候选。所以“路由”实际是：数值差 → 定死的三类全局算子目标量 → 固定强度扫描——不存在“差异属于什么类型就换什么工具”的机制。
-2. 会参考 VLM 信息吗：采用配置下完全不读
+### 1.3 已排除的解释
 
-* VLM 诊断结果只被存档：plan['diagnosis_vlm'] = diagnosis['vlm'].get('parsed')（run.py:164）——全代码库无任何下游消费点
-* 唯一例外是 vlm_can_disable_operators 门控（run.py:242-250）：开启时若 VLM 说某区域 operator: "none"，就把该区域计划置零——但 config_v052_gate.json 里该键为 false，即此路径死代码
+- 不是单纯容量不足：G3 容量探针中，过拟合实验的 r 从 0.35 提升到 0.813。
+- 不是简单换一个损失权重就能解决：SS1 点态重加权为 NULL。
+- 不是只换监督侧性就能解决：SS3 单侧全面劣于双侧。
+- 不是把同一损失只投给高需求样本就能解决：SS4 门控仍出现共享表示层面的外溢税。
 
-3. VLM 诊断实际起了多大作用：plan 层面 = 0，作用全在选择层
+---
 
-* VLM 在管线里的真实作用在下游 vlm_rank()（05 阶段）：listwise 评 12 候选 + top4 复评，产生 vlm_best 并参与 hybrid_best 仲裁——这是 L2 选择层，与诊断/计划无关
-* 讽刺的是：诊断阶段这次 call_vlm(reference_prompt(), [A,B]) 在当前 VLM 服务速度下单次要 ~45 分钟（每 case 2-3 次 VLM 调用的大头之一），而它的输出在采用配置下只是被写进 plan 存档——这是已知最贵的冗余调用；若要省钱，vlm_can_disable_operators 保持 false 的前提下这次调用可以直接跳过（会改 01_diagnosis.json 的 vlm 字段口径，需登记）一句话：数值诊断 → 公式换算 → 固定算子×固定强度网格；VLM 诊断在设计上被刻意限制为“只说方向不算数”，且当前配置下连方向都没人听——它的价值只在选择层（评选候选），不在计划层。
+## 2. 已完成实验与证据链
 
-### plan
+| 阶段 | 做法 | 结论 | 对下一步的约束 |
+|---|---|---|---|
+| 诊断 v1 | S0–S7、17 类失败标签、FAILURE_ATLAS | H1/H2/H4 证实，R0=0.0 | 后续实验必须围绕真实失败机制，而非泛泛增强 |
+| 语义 ROI / gain / fgunlock | 区域 oracle、EV 域、前景 mask 核验 | 机制 A 主导；G2 EV 域有约 +0.08/+0.11 的近对称解锁；fg 5350 verified | 区域映射需求真实存在，mask 与特征数据可用 |
+| G3 容量探针 | 小样本过拟合 | r 0.35→0.813，容量不是主要瓶颈 | 优先研究优化目标，而非扩大模型 |
+| RAL-SS1 | 点态重加权 | NULL | 不继续调点态权重 |
+| RAL-SS2 | 双侧分 bin 分离监督 | 机制有效：r +0.10~0.11；转化失败：PSNR −0.12~−0.19 | “可学”不等于“可获益”，税是主要问题 |
+| RAL-SS3 | 3 seeds ×20ep，单侧 vs 双侧 | 单侧全面劣于双侧 | 不能简单靠单侧损失解决 |
+| RAL-SS4 | 3 seeds ×20ep，高需求样本门控 | Track A 3/3 ΔPSNR −0.471/−0.476/−0.491；rest r 未受直接监督仍 +0.151~0.163，rest 税约 −0.51~−0.53 | 样本级门控控制不住共享表示外溢 |
+| visual_eval_v1 | M0–M5，PSNR+VLM+代理审阅 | C 是 PSNR winner；无视觉 winner | 下一轮仍须以官方 PSNR 为硬门 |
+| GTC M0/M0′ | 53 维需求特征聚类及单变量复跑 | 只认证出单轴连续的欠分离严重度结构，未认证出稳定多组结构 | 不宜直接做“多个离散需求组各自一套监督” |
 
-计划的执行机制（apply_plan，editor.py）
+以上结果的历史产物均冻结；详细收窄表述见 `/home/xx.xing/code/data/rsi-applegt/HANDOFF_ACTIVE.md`。
 
-1. 执行入口：12 次独立重渲染，不是链式加工run.py:run_case() 中：plan = build_plan(A,B,am,bm,diag,config) # 02_plan.jsonfor cid,p in candidate_parameters(plan,grid): # 12 个强度组合 im = apply_plan(A, edit_masks, p) # 每个候选都从原始 A 重渲染 save_rgb(cand_dir/f'{cid}.png', im)每个候选独立从 A 出发（plan 里明确 note："Candidates start from original A"），无误差累积；apply_plan 内部只做一次 RGB→Lab 转换。
-2. 强度网格：同一套 plan 目标量 × 12 档插值candidate_parameters() 把 plan 灌进固定网格（CANDIDATES_4，四轴 G/S/B/C）。强度是0~1（服装轴到 1.25）的线性插值系数——C00=(0,0,0,0) 是恒等（原 A），C08=(1,1,1,1) 是全量执行 plan：候选 (G, S, B, C)C00 (0,0,0,0)C01–C03 单轴全量C04–C06 单轴半量C07–C11 组合
-3. apply_plan 的执行顺序（一次 Lab 转换内）L 通道： L0 + g·(curve(L0) − L0) + s·skin·ΔL_skin
-  
-          └ 全局 tone 曲线插值 ┘   └ 肤色残差曝光 ┘
-  
-  a/b 通道：+ s·skin·Δa + b·bg·Δa（skin/bg 的 lab_shift）clothing：分位曲线映射（v0.3.1）+ 簇门控直通（v0.5.2，门限外像素不重着色）最后： skin_luma_refine —— unified face+neck 的 L* 7 锚分位曲线（v0.5.1）三个关键工程细节：
+---
 
-* 掩码软分割：skin/bg/cloth 三个 float mask 按和归一（total = max(1, sum)）——重叠区不会双重施加移位
-* tone 是插值不是替换：L + g·(curve(L)−L)，g=0 时严格恒等，g=1 时完全映射到目标分位——保证中间强度单调、可控
-* 执行顺序固定：全局 tone 与肤色 ΔL 同时写 L（肤色 ΔL 本身就是“满强度 tone 后的残差”，两者不冲突）；a/b 移位 → 衣服曲线 → 皮肤亮度细化（refine 永远最后）
+## 3. 聚类部分的完整设计与结果
 
-4. 渲染完之后（计划执行 ≠ 结束）12 张候选 → contact sheet → Code 评分（score_candidates：每候选对 B 的区域统计误差 + 保护区域 ΔLab）→ VLM 排序（listwise + top4）→ Hybrid 仲裁 → 06_final_comparison.png + summary。
-5. 变体（同构但不同实现）worktree 里有两条平行执行路径，全部配置门控、默认关：apply_plan_linear（EXP-1 R1/R2：float 线性直通）和 apply_plan_luma_first（R3：两阶段亮度先行链，Stage1 乘法增益 → Stage2 零亮度色度移位 + chroma clamp）。master 主路径仍是上述 Lab 单次转换的 apply_plan。一句话：plan 是“目标量说明书”，执行是“12 档强度的参数化重渲染 + 事后两套评价体系选优”——没有搜索、没有迭代 refine，每张候选是一次性确定的正向渲染。
+### 3.1 聚类要验证的假设
 
-### judge
+原假设 H1：失败样本可以按“GT 映射需求”聚成若干稳定需求组，组内映射方向一致；若能得到这样的组，后续 H2 才考虑为不同组施加不同监督。
 
-评价机制全景（三套评价器 + 一个仲裁）每张候选要过三道评价 + 一道仲裁，各算各的，互不污染：评价器 1：Code 数值误差（evaluate.py score_candidates）→ 04_code_scores最简的一层，就 4 列：
+聚类阶段的任务不是训练，而是先用零成本实验判断“离散分组监督”是否有数据基础。
 
-* 对每个区域（skin/background/global）算 region_error = |ΔL_mean|/100 + |Δa_mean|/128 + |Δb_mean|/128（三轴加权）
-* reference_error = 区域误差按 config 权重求和（skin 0.45 / bg 0.35 / global 0.2）
-* 保护检查：protected_deltaLab_mean——无权重区域的平均 ΔE76（防“乱涂没被惩罚的区域”）
-* gain = (baseline误差 − 候选误差)/baseline误差——报告里引用的 gain% 就是这个；排序取 reference_error 最低 → code_best评价器 2：语义评价（semantic_eval.py，v0.2）→ 04_semantic_scores，真正的 Code 主评价比评价器 1 细一个量级，每候选 × 每区域（face_skin/body_skin/hair/white_clothing/colored_clothing/background）：维度 怎么算color_error a*/b* 各 7 分位逐点差的均值（不是均值差！）luma_error L* 7 分位逐点差均值contrast_error 0.5×(L 动态范围差/100 + 局部对比度差/50)，局部对比度按 canonical edge 512 归一（分辨率不变量）neutral_error 白衣服专用：a/b 均值偏离中性高光/阴影 highlight_ratio（L≥99 占比）、shadow_ratio、p95/p5 端点差区域间关系（_relationships）：5 对关系的相对差——face−background 亮度差、face−clothing 亮度差、face−hair 亮度差、body−face 的 a/b 差（脸脖阶跃 step 的来源）。目标是匹配 B 的关系而非绝对值。空间项（_face_spatial）：脸区左/右半的 L 中位数差——唯一的非全局维度（但只有左右一维）。结构保持（preserve）：Sobel 边缘的 precision/recall F1 → structure_error = 1−F1，硬门 max_structure_error=0.60，不过门的候选直接排后面。总分配比（_score，透明的试点权重）：overall_semantic_error = 0.78×区域语义 + 0.12×全局(亮度/对比/高低端)
-  
-                       + 0.07×关系 + 0.03×脸部左右  （缺项重归一）
-  
-  评价器 3：VLM 感知评价（run.py vlm_rank）→ 05_vlm_result两次调用，输入精心防作弊：
+### 3.2 样本与防循环论证
 
-1. listwise（12 候选）：A + B + 12 候选 contact sheet + 语义区域 ROI 放大图；提示词明确“参考保真与视觉质量分开评、不许偏好更亮/更饱和的图” → vlm_best（不提供任何 Code 分数，保持独立可解释）
-2. top4 复评（Hybrid）：Code 语义分选出的 top4（select_diverse_top4）+ 把 top4 的 Code 测量值作为 evidence 附在 prompt 里，但声明“evidence 不是命令选最低分，分歧要解释"→ hybrid_best（只能从 top4 里选，65/65 从未越界——归因表已证）仲裁与产出
+- 聚类人口：AppleGT val 855 张中，至少有一个冻结失败标签的 **843 张**。
+- 12 张无标签样本不参与聚类。
+- 特征中**不使用 PSNR、r 或任何模型优化结果**，避免用待优化结果反向定义“需求”。
+- 所有输入均来自冻结诊断和语义轮产物，只读使用。
 
-* code_best = 语义分第一名；vlm_best = listwise 独立结论；hybrid_best = top4 约束下的知情复评
-* 三者全存 summary.json，06_final_comparison.png 逐面板展示
-* 已知盲区（与今日评审结论对齐）：语义评价的区域统计虽然到了分位级，但空间维度只有“脸左右”一维——光照的空间形状（光影从哪来、往哪去）没有任何度量项；VLM 能感知但只在选择层，无法反馈到 plan
+### 3.3 53 维特征
+
+1. **A：17 维归因标签强度**：亮度、阴影、HDR、区域映射、区域关系、强区域依赖需求等冻结标签。
+2. **B：2 维 region oracle**：`region_advantage_mae` 表示区域级映射相对全局映射的潜在收益；另加缺失指示。
+3. **C：25 维双侧误差与曲线特征**：对 person/background、face-skin/background、sky/background、foreground/nonforeground 四对区域，使用分离方向、分离误差、关系误差、平均关系误差和 GT 分离需求；再加入前景/非前景/全局曲线符号及离散度差。
+4. **D：9 维缺失指示**：区分“区域不存在”和“区域存在但误差为零”。
+
+所有连续列按 val 聚类人口做 z-score；M0 中全部标签强度也做 z-score。
+
+### 3.4 算法与预注册判定
+
+- KMeans，`n_init=10`，随机种子 11。
+- K 只在 {2,3,4,5,6} 中做一次预注册扫描，按 silhouette 选择，禁止网格调参。
+- 稳定性采用两道门：20 次随机保留 70% 特征，ARI 中位数至少 0.60；分别去掉 A/B/C 块，ARI 均至少 0.50。
+- 两道门同时通过，才允许进入分组监督短屏。
+
+### 3.5 M0 结果
+
+K=2 的 silhouette 最高（0.2259），得到 664/179 两簇：
+
+- 簇 0（664）：低亮度、HDR、全局亮度等标签为主，区域分离 signed 误差接近零。
+- 簇 1（179）：三类主要区域对的 signed 误差都为负，正方向样本只占 1%–7%，即一致表现为**欠分离/交付不足**；oracle 区域收益约为簇 0 的 2.4 倍。
+
+稳定性：bootstrap ARI 中位数 0.874，通过；去 A、去 B 分别为 0.922、0.974，通过；去 C 后仅 0.294，失败。说明这个二分组几乎完全由误差块承载。
+
+簇 1 与既有 `strong_region_dependent_mapping_requirement` 标签只有 94/177 的重合（53.1%），并非简单复现旧标签。但它的 signed 误差分位数连续，K≥3 只进一步切出同轴上的严重度片段，没有形成新的稳定需求类型。
+
+### 3.6 M0′ 修订及回答的问题
+
+诊断时曾怀疑：少数稀有标签只有 1–6 个样本，z-score 后会形成 |z|≈14–29 的尖峰，可能是距离度量不稳定的原因。
+
+M0′ 按预注册只改一件事：非零样本数 <30 的 7 个标签列改为原始 0/1 存在位，其余完全不变。结果：val 两簇分配 **0 个样本移动**；bootstrap 中位数和全距与 M0 相同；需求卡片逐字段相同；train 最近质心分配仅移动 1 个样本。
+
+因此，**z 尖峰不是稳定门失败的原因**。目前最稳妥的解释是：在该特征空间中，需求结构主要是单轴连续严重度，而不是多个离散、可稳定复现的需求组。
+
+### 3.7 聚类结论不能怎样解读
+
+- 不能说“需求异质性不存在”；只能说当前特征与 KMeans 协议没有认证出稳定多组结构。
+- 不能把 M0 的 val 聚类结果直接用于正式训练监督。当前 scaler 和质心在 val 上拟合，若再据此构造 train 标签并反复用 val 选模，会形成 **val→train 信息泄漏**。现有 train 分配只能作诊断参考。
+- 不能把 K=2 的稳定性失败理解为“这组 179 张图没有共同方向”。恰恰相反，它们的欠分离方向高度一致；失败的是“多个离散组”的稳定性认证。
+
+---
+
+## 4. 下一阶段的核心问题
+
+建议将下一阶段问题改写为：
+
+> **能否用 train 内部构造的连续需求分层，把分离监督限定在“确有需要且方向一致”的样本/区域，同时抑制共享表示对非需求样本的外溢？**
+
+这比继续寻找更多聚类簇更直接：现有证据已经支持一个强欠分离方向，不需要先证明存在很多离散组。
+
+---
+
+## 5. 推荐方案：M1′ 连续需求轴分层短屏
+
+### 5.1 与 SS4 的区别
+
+SS4 是“固定高需求标签 + 双侧分离损失”；M1′ 是“train 内连续需求分层 + 只纠正欠交付方向”。
+
+它检验的不是“再多做一次门控”，而是两个具体判断：
+
+1. 连续严重度是否比固定二值标签更准确地描述需求；
+2. 全局单侧监督在 SS3 失败后，是否只有在高需求子集内才有合理作用。
+
+### 5.2 分层构造（必须 train-only）
+
+- 只使用 train 的冻结特征和需求值，不读取 val 标签、val 质心或 val 分位数。
+- 主分层变量建议用 person/background 的 `gt_separation_demand`，其他区域对作辅助一致性检查。
+- 阈值由 train 分布确定，例如 train 有效样本需求的第 80 百分位；同一绝对阈值再应用到 val，仅用于评估。
+- 预期高需求层约 20%，但最终以 train 实测为准，不为凑比例调阈值。
+- 低需求层不接收新增分离监督，用于直接测量附带税。
+
+### 5.3 训练臂
+
+- **C**：同预算继续训练，复用现有冻结对照。
+- **M1′**：在高需求样本中，仅对“预测分离不足”的 bin/区域施加欠交付惩罚；已满足或过冲的 bin 不给同方向奖励。其余训练配方、预算、采样顺序与 C 对齐，λ 固定，不做网格搜索。
+
+首轮只跑 1 seed、20ep，约 3.5 小时；未过门不做 3 seeds。
+
+### 5.4 上线前门槛
+
+1. **无泄漏核验**：分层、阈值、权重全部由 train 产生；保存构造清单与哈希。
+2. **梯度审计**：至少 48 批训练分布回放，检查投放率、空窗率、辅助/基础梯度范数比、方向夹角和 person/background 均衡。
+3. **匹配性核验**：M1′ 与 C 的同种子数据顺序一致；评估和 checkpoint 身份可追踪。
+4. **预算门**：GPU 空闲且不属于他人任务，未过审计不启动训练。
+
+### 5.5 M1′ 进入正式实验的条件
+
+建议沿用并收紧现有门槛：
+
+- 全 val ΔPSNR ≥ −0.05 dB；
+- 高需求层 Δr ≥ +0.08，并有对应分离误差改善；
+- 低需求层 ΔPSNR 不劣于 SS2 同层税的 50%，且低需求层 r 不应再明显上升；
+- 六个固定案例无新的严重缺陷。
+
+任一硬性条件失败，就不进入 3-seed 正式实验。
+
+### 5.6 若 M1′ 通过：M2 正式验证
+
+3 seeds {11,22,33} ×20ep，全部 val 评估与六案例 panels：
+
+- **WIN**：3/3 seeds ΔPSNR ≥0，且低需求税不超过 SS2 的 50%；
+- **GATED-WIN**：多数 seed 守住 −0.05 dB，机制指标显著提升，但尚不足以替代 C；
+- **LOSS**：任一 seed 越过 −0.05 dB，或再次出现 SS2/SS4 式低需求税；
+- 任一失败都停止，不继续调 λ、调阈值或换种子“找一次成功”。
+
+---
+
+## 6. 备选方案与取舍
+
+### 方案 A：关闭路线，保留 C 作为最终交付
+
+**优点**：不再消耗 GPU，结论清晰；已有证据表明统一分离监督路线多次失败。  
+**缺点**：没有检验“连续需求分层”这一最后一个低成本变体；科学问题停在“知道会付税，但未充分解释税”。
+
+### 方案 B：执行 M1′ 连续轴分层短屏（推荐）
+
+**优点**：直接利用现有发现；不依赖多簇稳定；只需 1 seed 短屏；预注册停止条件能限制损失。  
+**缺点**：仍可能出现 SS4 式共享表示外溢；即使有效，也需要 3 seeds 才能确认。  
+**适用情形**：希望用最小预算把“需求连续而非离散”转化为一个可证伪的训练实验。
+
+### 方案 C：换特征空间继续聚类（不推荐）
+
+例如像素级残差图、原始曲线 bin、其他聚类算法。  
+**问题**：需要新构造特征管线，研究问题会从“监督如何转化”漂移到“如何制造更好看的簇”；目前没有证据表明新簇能解决 PSNR 税。
+
+---
+
+## 7. 风险与解释纪律
+
+1. **最大风险是低需求层继续付税**。这表示问题不只是“选谁监督”，而在共享表示或损失目标本身，应停止同家族实验。
+2. **高需求层 r 上升不等于成功**。必须同时看 PSNR、低需求层和固定案例。
+3. **视觉评价只能辅助**。当前 Qwen judge 未通过审计，不能用于把 PSNR 失败的臂包装成视觉 winner。
+4. **M0/M0′ 只提供机制线索，不提供训练合格率**。任何训练结论只能来自新的预注册短屏。
+5. **如果 M1′ 也失败**，建议把“分离监督及其投放/分层变体”整体冻结，后续转向损失目标或网络优化机制的重新设计，而非继续微调同一方案。
+
+---
+
+## 8. 建议向导师确认的决策
+
+1. 是否值得用约 3.5 小时完成 M1′ 单 seed 短屏，作为该研究路线的最后一次低成本检验？
+2. 是否接受“全 val PSNR 硬门 + 低需求税门 + 高需求机制门”三者同时作为晋级标准？
+3. 若 M1′ 失败，是否正式关闭分离监督路线，将后续重点改为“转化税的来源与损失目标重构”？
+
+**当前建议**：优先讨论并决定 M1′；不建议继续做以“找到更多簇”为目标的聚类扩展。
+
